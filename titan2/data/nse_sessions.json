@@ -1,0 +1,66 @@
+{
+  "about": "titan2 NSE equity-derivatives (F&O) session calendar, read by titan2.clock.SessionCalendar. A date is a trading session when it is a weekday that is not a holiday, unless special_sessions lists it (then its trade flag decides). Dates outside the listed years are never trading days. Holidays are the F&O-segment lists from the NSE circulars named in each year's source, checked against the circular PDFs on nsearchives.nseindia.com on 2026-10-10. Review yearly when NSE publishes the next list (usually mid-December).",
+  "regular_hours": [
+    {"from": "2025-01-01", "open": "09:15", "close": "15:30", "note": "F&O normal market"},
+    {"from": "2026-08-03", "open": "09:15", "close": "15:40", "note": "NSE extended the F&O close to 15:40 from 2026-08-03 (derivatives close = VWAP 15:10-15:40; cash-market closing auction for F&O stocks 15:15-15:35); verified 2026-10-10"}
+  ],
+  "years": {
+    "2025": {
+      "source": "NSE/FAOP/65588 (2024-12-13) trading holidays 2025; NSE/FAOP/65730 (2024-12-23) Budget live session; NSE/FAOP/70320 (2025-09-22) Muhurat session",
+      "holidays": [
+        "2025-02-26", "2025-03-14", "2025-03-31", "2025-04-10", "2025-04-14", "2025-04-18", "2025-05-01",
+        "2025-08-15", "2025-08-27", "2025-10-02", "2025-10-21", "2025-10-22", "2025-11-05", "2025-12-25"
+      ],
+      "holiday_names": {
+        "2025-02-26": "Mahashivratri",
+        "2025-03-14": "Holi",
+        "2025-03-31": "Id-Ul-Fitr (Ramadan Eid)",
+        "2025-04-10": "Shri Mahavir Jayanti",
+        "2025-04-14": "Dr. Baba Saheb Ambedkar Jayanti",
+        "2025-04-18": "Good Friday",
+        "2025-05-01": "Maharashtra Day",
+        "2025-08-15": "Independence Day",
+        "2025-08-27": "Ganesh Chaturthi",
+        "2025-10-02": "Mahatma Gandhi Jayanti/Dussehra",
+        "2025-10-21": "Diwali Laxmi Pujan (Muhurat session only)",
+        "2025-10-22": "Diwali-Balipratipada",
+        "2025-11-05": "Prakash Gurpurb Sri Guru Nanak Dev",
+        "2025-12-25": "Christmas"
+      },
+      "special_sessions": [
+        {"date": "2025-02-01", "open": "09:15", "close": "15:30", "trade": false, "note": "Union Budget live session (Saturday)"},
+        {"date": "2025-10-21", "open": "13:45", "close": "14:45", "trade": false, "note": "Diwali Muhurat session"}
+      ]
+    },
+    "2026": {
+      "source": "NSE/FAOP/71777 (2025-12-12) trading holidays 2026; NSE/FAOP/72262 (2026-01-12) adds 2026-01-15; NSE/FAOP/72352 (2026-01-16) Budget live session",
+      "holidays": [
+        "2026-01-15", "2026-01-26", "2026-03-03", "2026-03-26", "2026-03-31", "2026-04-03", "2026-04-14",
+        "2026-05-01", "2026-05-28", "2026-06-26", "2026-09-14", "2026-10-02", "2026-10-20", "2026-11-10",
+        "2026-11-24", "2026-12-25"
+      ],
+      "holiday_names": {
+        "2026-01-15": "Municipal Corporation Election - Maharashtra",
+        "2026-01-26": "Republic Day",
+        "2026-03-03": "Holi",
+        "2026-03-26": "Shri Ram Navami",
+        "2026-03-31": "Shri Mahavir Jayanti",
+        "2026-04-03": "Good Friday",
+        "2026-04-14": "Dr. Baba Saheb Ambedkar Jayanti",
+        "2026-05-01": "Maharashtra Day",
+        "2026-05-28": "Bakri Id",
+        "2026-06-26": "Muharram",
+        "2026-09-14": "Ganesh Chaturthi",
+        "2026-10-02": "Mahatma Gandhi Jayanti",
+        "2026-10-20": "Dussehra",
+        "2026-11-10": "Diwali-Balipratipada",
+        "2026-11-24": "Prakash Gurpurb Sri Guru Nanak Dev",
+        "2026-12-25": "Christmas"
+      },
+      "special_sessions": [
+        {"date": "2026-02-01", "open": "09:15", "close": "15:30", "trade": false, "note": "Union Budget live session (Sunday)"}
+      ],
+      "notes": "Muhurat trading on Sunday 2026-11-08 (Diwali Laxmi Pujan); NSE had not notified its timings by 2026-10-10. It is a weekend session titan2 never trades, so it needs no entry."
+    }
+  }
+}

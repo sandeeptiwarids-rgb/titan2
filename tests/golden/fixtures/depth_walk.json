@@ -1,0 +1,144 @@
+{
+  "area": "depth_walk",
+  "format": 1,
+  "v1": {
+    "rev": "b4694f3",
+    "tag": "v1-final",
+    "files": {
+      "zerodha_tools.py": {
+        "blob": "91d327b195c9d08ed68bbb0604abf8e2edfbf12b",
+        "spans": {"ZerodhaTools._check_option_liquidity:block": [4633, 4657]}
+      },
+      "dashboard.py": {"blob": "811ef481ce7b38532ebfa2ae89458cc485ca9e84", "spans": {"pnl_live:block": [4255, 4270]}}
+    }
+  },
+  "driver": "the two inline v1 walk blocks, each wrapped in a function returning its locals; tools runs with max_slip = inf, dashboard with realizable = ltp as at line 4248",
+  "cases": [
+    {
+      "id": "sell_inside_best_level",
+      "side": "SELL",
+      "book": [[31.7, 1200, 4], [31.65, 800, 3], [31.6, 500, 2], [31.55, 300, 1], [31.5, 900, 5]],
+      "qty": 500,
+      "ltp": 31.8,
+      "expect": "SAME",
+      "v1": {
+        "tools": {"filled": 500, "weighted": 15850.0, "levels_crossed": 1, "avg_fill": 31.7},
+        "dashboard": {"filled": 500, "weighted": 15850.0, "realizable": 31.7}
+      }
+    },
+    {
+      "id": "sell_sweeps_three_levels",
+      "side": "SELL",
+      "book": [[31.7, 1200, 4], [31.65, 800, 3], [31.6, 500, 2], [31.55, 300, 1], [31.5, 900, 5]],
+      "qty": 2400,
+      "ltp": 31.8,
+      "expect": "SAME",
+      "v1": {
+        "tools": {"filled": 2400, "weighted": 76000.0, "levels_crossed": 3, "avg_fill": 31.666666666666668},
+        "dashboard": {"filled": 2400, "weighted": 76000.0, "realizable": 31.666666666666668}
+      }
+    },
+    {
+      "id": "sell_exactly_the_whole_book",
+      "side": "SELL",
+      "book": [[31.7, 1200, 4], [31.65, 800, 3], [31.6, 500, 2], [31.55, 300, 1], [31.5, 900, 5]],
+      "qty": 3700,
+      "ltp": 31.8,
+      "expect": "SAME",
+      "v1": {
+        "tools": {"filled": 3700, "weighted": 116975.0, "levels_crossed": 5, "avg_fill": 31.614864864864863},
+        "dashboard": {"filled": 3700, "weighted": 116975.0, "realizable": 31.614864864864863}
+      }
+    },
+    {
+      "id": "sell_book_covers_96pct",
+      "side": "SELL",
+      "book": [[31.7, 1200, 4], [31.65, 800, 3], [31.6, 500, 2], [31.55, 300, 1], [31.5, 900, 5]],
+      "qty": 3850,
+      "ltp": 31.8,
+      "expect": "D_WALK_95PCT_RULE",
+      "v1": {
+        "tools": {"filled": 3700, "weighted": 116975.0, "levels_crossed": 5, "avg_fill": 31.614864864864863},
+        "dashboard": {"filled": 3700, "weighted": 116975.0, "realizable": 31.614864864864863}
+      }
+    },
+    {
+      "id": "sell_book_covers_62pct",
+      "side": "SELL",
+      "book": [[31.7, 1200, 4], [31.65, 800, 3], [31.6, 500, 2], [31.55, 300, 1], [31.5, 900, 5]],
+      "qty": 6000,
+      "ltp": 31.8,
+      "expect": "D_WALK_NO_LTP_FALLBACK",
+      "v1": {
+        "tools": {"filled": 3700, "weighted": 116975.0, "levels_crossed": 5, "avg_fill": null},
+        "dashboard": {"filled": 3700, "weighted": 116975.0, "realizable": 31.8}
+      }
+    },
+    {
+      "id": "sell_zero_padded_two_levels",
+      "side": "SELL",
+      "book": [[12.4, 450, 2], [12.35, 900, 3], [0, 0, 0], [0, 0, 0], [0, 0, 0]],
+      "qty": 900,
+      "ltp": 12.45,
+      "expect": "SAME",
+      "v1": {
+        "tools": {"filled": 900, "weighted": 11137.5, "levels_crossed": 2, "avg_fill": 12.375},
+        "dashboard": {"filled": 900, "weighted": 11137.5, "realizable": 12.375}
+      }
+    },
+    {
+      "id": "sell_empty_bid_side",
+      "side": "SELL",
+      "book": [[0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0], [0, 0, 0]],
+      "qty": 450,
+      "ltp": 12.5,
+      "expect": "D_WALK_NO_LTP_FALLBACK",
+      "v1": {
+        "tools": {"filled": 0, "weighted": 0.0, "levels_crossed": 0, "avg_fill": null},
+        "dashboard": {"filled": 0, "weighted": 0.0, "realizable": 12.5}
+      }
+    },
+    {
+      "id": "sell_four_levels_hindpetro_like",
+      "side": "SELL",
+      "book": [[8.15, 1350, 3], [8.1, 2025, 4], [8.05, 1350, 2], [8.0, 2700, 6], [0, 0, 0]],
+      "qty": 6750,
+      "ltp": 8.2,
+      "expect": "SAME",
+      "v1": {
+        "tools": {"filled": 6750, "weighted": 54472.5, "levels_crossed": 4, "avg_fill": 8.07},
+        "dashboard": {"filled": 6750, "weighted": 54472.5, "realizable": 8.07}
+      }
+    },
+    {
+      "id": "sell_cheap_contract_deep_book",
+      "side": "SELL",
+      "book": [[1.15, 4300, 2], [1.1, 8600, 5], [1.05, 4300, 1], [1.0, 12900, 7], [0.95, 4300, 1]],
+      "qty": 25800,
+      "ltp": 1.2,
+      "expect": "SAME",
+      "v1": {
+        "tools": {"filled": 25800, "weighted": 27520.0, "levels_crossed": 4, "avg_fill": 1.0666666666666667},
+        "dashboard": {"filled": 25800, "weighted": 27520.0, "realizable": 1.0666666666666667}
+      }
+    },
+    {
+      "id": "buy_sweeps_three_asks",
+      "side": "BUY",
+      "book": [[32.1, 300, 1], [32.15, 500, 2], [32.2, 400, 1], [0, 0, 0], [0, 0, 0]],
+      "qty": 1000,
+      "ltp": 32.0,
+      "expect": null,
+      "v1": {"tools": {"filled": 1000, "weighted": 32145.0, "levels_crossed": 3, "avg_fill": 32.145}}
+    },
+    {
+      "id": "buy_asks_run_out",
+      "side": "BUY",
+      "book": [[32.1, 300, 1], [32.15, 500, 2], [0, 0, 0], [0, 0, 0], [0, 0, 0]],
+      "qty": 1000,
+      "ltp": 32.0,
+      "expect": null,
+      "v1": {"tools": {"filled": 800, "weighted": 25705.0, "levels_crossed": 2, "avg_fill": null}}
+    }
+  ]
+}

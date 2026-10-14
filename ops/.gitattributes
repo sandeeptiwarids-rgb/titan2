@@ -1,0 +1,4 @@
+# Scripts and unit files run on Linux: keep LF line endings in every checkout (core.autocrlf=true included).
+* text eol=lf
+# Not part of a release (git archive).
+.gitattributes export-ignore

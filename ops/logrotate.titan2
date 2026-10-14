@@ -1,0 +1,12 @@
+# /etc/logrotate.d/titan2 - installed by ops/bootstrap.sh (DETAIL 13.3). The bot logs through a WatchedFileHandler,
+# which reopens a rotated file by itself, so no copytruncate. `su` because /var/log/titan2 belongs to titan.
+/var/log/titan2/*.log {
+    su titan titan
+    daily
+    rotate 60
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 titan titan
+}

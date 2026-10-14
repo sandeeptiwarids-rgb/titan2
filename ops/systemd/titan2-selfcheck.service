@@ -1,0 +1,26 @@
+# titan2-selfcheck.service: the morning self-check (DETAIL §13.7) at 08:40 IST. It reports only: a Telegram summary
+# and reports/selfcheck-*.json; it exits 2 when any row FAILs, which also fires the OnFailure alert. The bot runs the
+# prestart phase in-process; nothing here can block the bot's start.
+[Unit]
+Description=titan2 morning self-check (Telegram summary)
+Wants=network-online.target
+After=network-online.target time-sync.target
+OnFailure=titan2-alert@%n.service
+
+[Service]
+Type=oneshot
+User=titan
+Group=titan
+UMask=0027
+WorkingDirectory=/home/ubuntu/titan/agentic_trader
+EnvironmentFile=/etc/titan2/titan2.env
+Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 TZ=Asia/Kolkata TITAN2_VAR=/var/lib/titan2
+ExecStart=/home/ubuntu/titan/current/venv/bin/python -m titan2 selfcheck --phase morning
+TimeoutStartSec=300
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+# db/: SQLite must create titan2.db's -shm/-wal to read the WAL database while the bot is not running (08:40).
+ReadWritePaths=/var/lib/titan2/reports /var/lib/titan2/db
+SyslogIdentifier=titan2-selfcheck

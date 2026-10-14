@@ -1,0 +1,30 @@
+# titan2-dash.service: the read-only dashboard (DETAIL §12, §13.3). User titandash has no broker credentials and
+# cannot read /etc/titan2/titan2.env or the session; it reads pub/*.json and may only insert PAUSE/RESUME/
+# FLATTEN_ALL rows into dash/commands_dash.db. Bound to 127.0.0.1:8050; reach it over an SSH tunnel:
+#   ssh -N -L 8050:127.0.0.1:8050 titan-bot
+# The app refuses to start without DASH_USER, DASH_PASS_SCRYPT and DASH_SECRET (/etc/titan2/dash.env).
+[Unit]
+Description=titan2 dashboard (read-only, 127.0.0.1:8050 over an SSH tunnel)
+After=network.target
+OnFailure=titan2-alert@%n.service
+
+[Service]
+Type=simple
+User=titandash
+Group=titandash
+UMask=0027
+WorkingDirectory=/home/ubuntu/titan/agentic_trader
+EnvironmentFile=/etc/titan2/dash.env
+Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 TZ=Asia/Kolkata TITAN2_VAR=/var/lib/titan2
+ExecStart=/home/ubuntu/titan/current/venv/bin/gunicorn -w 1 --threads 4 -k gthread -b 127.0.0.1:8050 titan2.dash.app:app
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+ReadWritePaths=/var/lib/titan2/dash
+SyslogIdentifier=titan2-dash
+
+[Install]
+WantedBy=multi-user.target

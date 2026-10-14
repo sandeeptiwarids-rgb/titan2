@@ -1,0 +1,20 @@
+# titan2-alert@.service: the OnFailure handler of every titan2 unit (DETAIL §13.3, §13.9). %i is the failed unit's
+# name. It sends a CRITICAL Telegram alert, and pings healthchecks /fail only when the failed unit is titan2-bot
+# (titan2.alerts.critical_now). It has no OnFailure of its own (no loops).
+[Unit]
+Description=titan2 CRITICAL alert: unit %i failed
+
+[Service]
+Type=oneshot
+User=titan
+Group=titan
+WorkingDirectory=/home/ubuntu/titan/agentic_trader
+EnvironmentFile=/etc/titan2/titan2.env
+Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 TZ=Asia/Kolkata TITAN2_VAR=/var/lib/titan2
+ExecStart=/home/ubuntu/titan/current/venv/bin/python -m titan2 alert --critical "unit %i failed"
+TimeoutStartSec=120
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+SyslogIdentifier=titan2-alert

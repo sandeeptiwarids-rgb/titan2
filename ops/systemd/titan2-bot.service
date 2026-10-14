@@ -1,0 +1,42 @@
+# titan2-bot.service: the trading core, the sole owner of every order (DETAIL §13.3).
+# NO ExecStartPre: a restart with open positions must never be blocked; the self-check runs in-process and a
+# failure only raises entry halts, so exits continue. The service is enabled (any boot starts it) and
+# titan2-bot.timer starts the daily run; outside a session the bot sends READY + STOPPING and exits 0.
+# Exit codes: 0 done; 3 exception storm and 75 controlled restart (token, websocket): restarted;
+# 73 lock held and 78 fatal config/DB: not restarted (OnFailure alert).
+# Edit this file in git: a deploy (ops/release.sh, step 8) installs changed unit files into /etc/systemd/system,
+# but never replaces a masked one.
+[Unit]
+Description=Titan v2 trading core (sole order owner)
+Wants=network-online.target
+After=network-online.target time-sync.target
+OnFailure=titan2-alert@%n.service
+StartLimitIntervalSec=900
+StartLimitBurst=5
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=titan
+Group=titan
+UMask=0027
+WorkingDirectory=/home/ubuntu/titan/agentic_trader
+EnvironmentFile=/etc/titan2/titan2.env
+Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 TZ=Asia/Kolkata TITAN2_VAR=/var/lib/titan2
+ExecStart=/home/ubuntu/titan/current/venv/bin/python -m titan2 bot
+Restart=on-failure
+RestartSec=5
+RestartPreventExitStatus=73 78
+TimeoutStartSec=300
+TimeoutStopSec=45
+WatchdogSec=30
+MemoryMax=1G
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+ReadWritePaths=/var/lib/titan2 /var/log/titan2
+SyslogIdentifier=titan2-bot
+
+[Install]
+WantedBy=multi-user.target

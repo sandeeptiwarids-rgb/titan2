@@ -1,0 +1,18 @@
+{
+  "_engine": {
+    "engine_semantics_version": 2,
+    "semantic_constants_hash": "b210231bd67cc32fbe0111401adb9fc68bd5262bae5822abaf0033d11f9ebc18"
+  },
+  "opening_drive": {
+    "ast_hash": "802605155cf2924ac859ea1dc67a3c87c285a54f4fcba06913171b3e089d0edd",
+    "logic_version": 1
+  },
+  "price_spike_down": {
+    "ast_hash": "5b79f038cf4a20bfb2a308cc319f23024ce17a39380da8bae84fc29d9633820f",
+    "logic_version": 1
+  },
+  "price_spike_up": {
+    "ast_hash": "fb09fbb8185aba5fc3596e65793c6fc2f9baf7d762c6d70fb10ae07675ca95fd",
+    "logic_version": 1
+  }
+}

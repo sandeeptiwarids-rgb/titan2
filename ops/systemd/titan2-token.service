@@ -1,0 +1,26 @@
+# titan2-token.service: the only login (DETAIL §13.5). It refreshes session/kite_session.json (atomic, 0600) by the
+# headless TOTP login (TOKEN_MODE=auto) or sends the login URL to Telegram (TOKEN_MODE=manual), and verifies it with
+# profile(). It never edits an env file and never restarts anything: the bot re-reads the file every 30 s while
+# HALT(TOKEN) is active and restarts itself (exit 75) on a newer token.
+[Unit]
+Description=titan2 Kite session refresh (the only login)
+Wants=network-online.target
+After=network-online.target time-sync.target
+OnFailure=titan2-alert@%n.service
+
+[Service]
+Type=oneshot
+User=titan
+Group=titan
+UMask=0077
+WorkingDirectory=/home/ubuntu/titan/agentic_trader
+EnvironmentFile=/etc/titan2/titan2.env
+Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 TZ=Asia/Kolkata TITAN2_VAR=/var/lib/titan2
+ExecStart=/home/ubuntu/titan/current/venv/bin/python -m titan2 token
+TimeoutStartSec=600
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+ReadWritePaths=/var/lib/titan2/session
+SyslogIdentifier=titan2-token

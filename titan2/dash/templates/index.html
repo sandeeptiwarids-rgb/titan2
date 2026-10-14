@@ -1,0 +1,356 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>titan2</title>
+<style nonce="__CSP_NONCE__">
+:root{--bg:#f5f6f8;--fg:#1c2128;--muted:#66707c;--card:#fff;--line:#dde1e6;--bad:#b42318;--badbg:#fde8e7;--warn:#9a6700;--good:#1a7f37;--accent:#2457c5}
+@media (prefers-color-scheme:dark){:root{--bg:#0e1217;--fg:#e2e6eb;--muted:#8c96a2;--card:#161b22;--line:#29303a;--bad:#ff7b72;--badbg:#3a1616;--warn:#e3b341;--good:#56d364;--accent:#7aa7ff}}
+*{box-sizing:border-box}
+body{margin:0;font:13px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:var(--bg);color:var(--fg)}
+header{display:flex;flex-wrap:wrap;align-items:center;gap:8px 16px;padding:10px 16px;background:var(--card);border-bottom:1px solid var(--line)}
+h1{font-size:16px;margin:0}
+h2{font-size:12px;margin:0 0 6px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)}
+main{display:grid;gap:12px;padding:12px 16px}
+section{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:10px 12px;overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}
+th,td{padding:3px 8px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap;vertical-align:top}
+th{color:var(--muted);font-weight:600}
+td.num{text-align:right}
+tr.click{cursor:pointer}
+tr.click:hover td{background:var(--bg)}
+.info{color:var(--muted);opacity:.75}
+.neg{color:var(--bad)}
+.pos{color:var(--good)}
+.CRITICAL{color:var(--bad);font-weight:600}
+.WARN{color:var(--warn)}
+.muted{color:var(--muted)}
+.banner{padding:10px 16px;background:var(--badbg);color:var(--bad);font-size:15px;font-weight:700;border-bottom:1px solid var(--bad)}
+body.stale main{opacity:.5}
+.controls{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-left:auto}
+button{font:inherit;padding:4px 10px;border:1px solid var(--line);border-radius:4px;background:var(--card);color:var(--fg);cursor:pointer}
+button.danger{border-color:var(--bad);color:var(--bad)}
+button:disabled{opacity:.45;cursor:default}
+nav{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}
+nav button.on{border-color:var(--accent);color:var(--accent)}
+input{font:inherit;padding:3px 6px;width:9em}
+dialog{max-width:96vw;max-height:90vh;overflow:auto;background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:6px}
+</style>
+</head>
+<body>
+<header>
+  <h1>titan2</h1>
+  <span id="summary" class="muted">loading…</span>
+  <div class="controls">
+    <button type="button" id="pause">Pause entries</button>
+    <button type="button" id="resume">Resume</button>
+    <button type="button" id="flatten" class="danger">Flatten all…</button>
+    <span id="flatten-box" hidden>
+      <input id="flatten-text" autocomplete="off" spellcheck="false" placeholder="type FLATTEN" aria-label="Type FLATTEN to confirm">
+      <button type="button" id="flatten-send" class="danger" disabled>Send FLATTEN_ALL</button>
+      <button type="button" id="flatten-cancel">Cancel</button>
+    </span>
+  </div>
+  <span id="msg" class="muted" role="status"></span>
+</header>
+<div id="banner" class="banner" role="alert" hidden></div>
+<main>
+  <section><h2>Entry halts</h2><div id="halts"></div></section>
+  <section><h2>Open positions · MTM is net of charges at the realizable bid · LTP is info only</h2><div id="positions"></div></section>
+  <section><h2>Books</h2><div id="books"></div></section>
+  <section><h2>Accounts and broker positions</h2><div id="accounts"></div></section>
+  <section><h2>Strategies</h2><div id="strategies"></div></section>
+  <section>
+    <nav id="tabs">
+      <button type="button" data-tab="today" class="on">Trades today</button>
+      <button type="button" data-tab="90d">Trades 90 days</button>
+      <button type="button" data-tab="events">Events</button>
+      <button type="button" data-tab="g1">G1</button>
+      <button type="button" data-tab="commands">Commands</button>
+    </nav>
+    <p id="tab-note" class="muted"></p>
+    <div id="tab"></div>
+  </section>
+</main>
+<dialog id="detail"><button type="button" id="detail-close">Close</button><div id="detail-body"></div></dialog>
+<script nonce="__CSP_NONCE__">
+'use strict';
+// The dashboard computes nothing: every number is shown exactly as the bot published it in pub/*.json.
+const POLL_MS = 2000;
+const SLOW_TAB_MS = {'90d': 30000, g1: 30000};          // written at EOD / per G1 report: no need to redraw every poll
+const OFFLINE_BANNER = 'bot offline — use the Kite app';
+const PANELS = ['halts', 'positions', 'books', 'accounts', 'strategies'];
+const TRADE_COLS = ['structure_id', 'session', 'book', 'symbol', 'qty', 'entry_ts', 'exit_ts', 'entry_avg', 'exit_avg',
+  'gross', 'charges', 'net', 'net_pct', 'brokerage', 'stt', 'txn', 'sebi', 'ipft', 'gst', 'stamp', 'sqoff_fee',
+  'entry_slip_vs_mid_pct', 'exit_slip_vs_mid_pct', 'mfe_pct', 'mae_pct', 'exit_reason', 'pnl_status',
+  'ltp_entry', 'ltp_exit'];
+let tab = 'today';
+let tabLoadedAt = 0;
+let busy = false;
+let botOffline = true;
+
+const $ = (id) => document.getElementById(id);
+const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+
+function show(v) {
+  if (v === null || v === undefined || v === '') return '—';
+  if (typeof v === 'number') return Number.isInteger(v) ? String(v) : v.toFixed(2);
+  if (typeof v === 'boolean') return v ? 'yes' : 'no';
+  if (typeof v === 'object') return JSON.stringify(v);
+  return String(v);
+}
+
+// A null MTM means unknown (stale quote or no bid), never zero.
+const money = (v) => (v === null || v === undefined ? 'unknown' : show(v));
+const isLtp = (k) => /(^|_)ltp/.test(k);
+const isMoney = (k) => /(^|_)(net|gross|charges|mtm|pnl)(_|$)/.test(k);
+
+function listOf(d, ...keys) {
+  if (Array.isArray(d)) return d;
+  for (const k of keys) if (isObj(d) && Array.isArray(d[k])) return d[k];
+  return [];
+}
+
+// cols: [key or row => value, label, kind]; kind 'money' shows null as unknown, 'info' greys the column out.
+function table(cols, rows, onRow) {
+  if (!rows || !rows.length) return el('p', 'muted', 'none');
+  const t = el('table');
+  const head = el('tr');
+  for (const [, label, kind] of cols) head.append(el('th', kind === 'info' ? 'info' : '', label));
+  t.append(head);
+  for (const r of rows) {
+    const tr = el('tr', onRow ? 'click' : '');
+    for (const [key, , kind] of cols) {
+      const v = typeof key === 'function' ? key(r) : (isObj(r) ? r[key] : undefined);
+      const td = el('td', kind === 'info' ? 'info' : '', kind === 'money' ? money(v) : show(v));
+      if (typeof v === 'number') td.classList.add('num');
+      if (kind === 'money' && typeof v === 'number' && v !== 0) td.classList.add(v < 0 ? 'neg' : 'pos');
+      if (key === 'severity' && /^[A-Z]+$/.test(String(v))) td.classList.add(v);
+      tr.append(td);
+    }
+    if (onRow) tr.addEventListener('click', () => onRow(r));
+    t.append(tr);
+  }
+  return t;
+}
+
+function autoCols(rows, preferred) {
+  const objs = rows.filter(isObj);
+  const keys = (preferred || []).filter((k) => objs.some((r) => k in r));
+  for (const r of objs) for (const k of Object.keys(r)) if (!keys.includes(k)) keys.push(k);
+  return keys.map((k) => (isLtp(k) ? [k, k + ' (info only)', 'info'] : [k, k, isMoney(k) ? 'money' : undefined]));
+}
+
+async function getJSON(url) {
+  const r = await fetch(url, {cache: 'no-store', credentials: 'same-origin'});
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok && !body.error) body.error = 'HTTP ' + r.status;
+  return body;
+}
+
+const fileNote = (d) => (d.ok ? d.file + ' written ' + show(d.age_s) + ' s ago.' : (d.error || 'not available') + '.');
+
+function brokerPos(p) {
+  if (!isObj(p)) return show(p);
+  return [p.tradingsymbol ?? p.symbol, p.product, p.quantity ?? p.qty, p.average_price ?? p.avg_price]
+    .filter((x) => x !== undefined && x !== null).map(show).join(' ');
+}
+
+function renderStatus(s) {
+  const f = isObj(s.feed) ? s.feed : {};
+  $('summary').textContent = [
+    'session ' + show(s.session), 'phase ' + show(s.phase), 'heartbeat ' + show(s.heartbeat_age_s) + ' s',
+    'live orders ' + (s.allow_live ? 'ALLOWED' : 'off'),
+    'feed ' + (f.connected ? 'connected' : 'DISCONNECTED') + (f.warm ? '' : ', cold') + (f.degraded ? ', DEGRADED' : '') +
+      ', last tick ' + show(f.last_tick_age_s) + ' s, reconnects ' + show(f.reconnects),
+    'pending commands ' + show(s.pending_commands), 'unacked critical ' + show(s.unacked_critical),
+  ].join(' · ');
+  $('halts').replaceChildren(table([['halt_id', 'id'], ['scope', 'scope'], ['kind', 'kind'], ['reason', 'reason'],
+    ['since', 'since'], ['clears', 'clears']], s.entry_halts));
+  $('positions').replaceChildren(table([['structure_id', 'id'], ['book', 'book'], ['symbol', 'symbol'], ['qty', 'qty'],
+    ['entry_avg', 'entry avg'], ['bid', 'bid'], ['ask', 'ask'], ['age_ms', 'quote age ms'], ['src', 'src'],
+    ['rb', 'realizable bid'], ['mtm_net', 'MTM net @ bid', 'money'], ['stop', 'stop'], ['lock_armed', 'lock'],
+    ['tp', 'target'], ['time_stop_in_s', 'time stop in s'], ['mfe_pct', 'MFE %'], ['mae_pct', 'MAE %'],
+    ['state', 'state'], ['exit_reason', 'exit reason'], ['ltp_info', 'LTP (info only)', 'info']], s.positions));
+  const books = Object.entries(isObj(s.books) ? s.books : {}).map(([book, b]) => Object.assign({book}, b));
+  $('books').replaceChildren(table([['book', 'book'], ['policy', 'policy'], ['realized_net', 'realized net', 'money'],
+    ['mtm_net', 'MTM net @ bid', 'money'], ['entries', 'entries'], ['max_entries', 'max entries'], ['open', 'open'],
+    ['daily_stop_room', 'daily-stop room', 'money'], ['worst_case_room', 'worst-case room', 'money'],
+    [(b) => Object.entries(isObj(b.cooldowns) ? b.cooldowns : {}).map(([u, t]) => u + ' until ' + t).join(', '),
+      'cooldowns']], books));
+  const accounts = Object.entries(isObj(s.accounts) ? s.accounts : {}).map(([account, a]) => Object.assign({account}, a));
+  $('accounts').replaceChildren(table([['account', 'account'], ['recon', 'recon'], ['recon_age_s', 'recon age s'],
+    ['available_rs', 'available ₹', 'money'],
+    [(a) => (Array.isArray(a.broker_positions) ? a.broker_positions : []).map(brokerPos).join('; '),
+      'broker positions (as the broker reports them)']], accounts));
+  const trial = (r) => (isObj(r.trial) ? r.trial : {});
+  $('strategies').replaceChildren(table([['name', 'strategy'], ['version', 'version'], ['mode', 'mode'],
+    ['pending_mode', 'pending mode'], [(r) => trial(r).state, 'trial'], [(r) => trial(r).n, 'n'],
+    [(r) => trial(r).sessions, 'sessions'], [(r) => trial(r).exp_pct, 'Exp %'], [(r) => trial(r).lb_pct, 'LB %'],
+    [(r) => trial(r).next_look, 'next look']], s.strategies));
+}
+
+// Without a readable status nothing is known: never leave an older view looking current.
+function renderUnknown(reason) {
+  $('summary').textContent = 'status unknown';
+  for (const id of PANELS) $(id).replaceChildren(el('p', 'muted', 'unknown: ' + reason));
+}
+
+async function loadTab() {
+  tabLoadedAt = Date.now();
+  let note = '';
+  let node;
+  if (tab === 'today' || tab === '90d') {
+    const d = await getJSON('/api/trades?scope=' + tab);
+    const rows = listOf(d.data, 'trades', 'rows');
+    note = fileNote(d) + ' Net is from fills after every charge. Click a row for its orders, fills and 1-min path.';
+    node = table(autoCols(rows, TRADE_COLS), rows, (r) => openTrade(r.structure_id).catch((e) => {
+      $('msg').textContent = 'trade ' + r.structure_id + ' not loaded: ' + e.message;
+    }));
+  } else if (tab === 'events') {
+    const d = await getJSON('/api/events');
+    const rows = listOf(d.data, 'events', 'rows').slice();
+    const first = rows[0];
+    const last = rows[rows.length - 1];
+    if (isObj(first) && isObj(last) && first.seq < last.seq) rows.reverse();          // newest first
+    note = fileNote(d);
+    node = table([['seq', 'seq'], ['ts', 'time'], ['severity', 'severity'], ['kind', 'kind'], ['account', 'account'],
+      ['book', 'book'], ['structure_id', 'structure'], ['payload', 'payload']], rows);
+  } else if (tab === 'g1') {
+    const d = await getJSON('/api/g1');
+    const rows = listOf(d.data, 'strategies', 'scorecards', 'rows');
+    note = fileNote(d) + ' A PROGRESS report is progress, not a decision.';
+    node = table(autoCols(rows, ['strategy', 'version', 'state', 'kind', 'n', 'sessions', 'exp_pct', 'lb_pct',
+      'placebo_exp_pct', 'next_look']), rows);
+  } else {
+    const d = await getJSON('/api/acks');
+    const acks = listOf(d.data, 'acks', 'rows');
+    const dashAcks = acks.filter((a) => isObj(a) && a.source === 'DASH');
+    const newest = dashAcks.reduce((m, a) => Math.max(m, Number(a.cmd_id) || 0), 0);
+    const sent = (Array.isArray(d.sent) ? d.sent : []).map((c) => {
+      const ack = dashAcks.find((a) => a.cmd_id === c.cmd_id);
+      const bot = ack ? ack.status : (c.cmd_id > newest ? 'waiting for the bot' : 'acked (older than the last 50)');
+      return Object.assign({bot}, c);
+    });
+    note = fileNote(d) + (d.sent_error ? ' ' + d.sent_error : '');
+    node = el('div');
+    node.append(el('h2', '', 'Sent from this dashboard'),
+      table([['cmd_id', 'cmd'], ['created_ts', 'sent'], ['kind', 'kind'], ['requested_by', 'by'],
+        ['bot', 'bot status']], sent),
+      el('h2', '', 'Bot acks (last 50, dashboard and CLI)'),
+      table(autoCols(acks, ['source', 'cmd_id', 'kind', 'status', 'result', 'picked_ts', 'done_ts']), acks));
+  }
+  $('tab-note').textContent = note;
+  $('tab').replaceChildren(node);
+}
+
+async function openTrade(id) {
+  if (id === undefined || id === null) return;
+  const d = await getJSON('/api/trade/' + encodeURIComponent(id));
+  const body = $('detail-body');
+  body.replaceChildren(el('h2', '', 'Trade ' + id + (d.ok ? '' : ': ' + (d.error || 'not available'))));
+  const data = Array.isArray(d.data) ? {rows: d.data} : (isObj(d.data) ? d.data : {});
+  for (const [k, v] of Object.entries(data)) {
+    body.append(el('h2', '', k));
+    if (Array.isArray(v)) body.append(table(autoCols(v), v));
+    else if (isObj(v)) body.append(table(autoCols([v]), [v]));
+    else body.append(el('p', '', show(v)));
+  }
+  $('detail').showModal();
+}
+
+async function sendCommand(kind, confirmText) {
+  const msg = $('msg');
+  msg.textContent = 'sending ' + kind + '…';
+  try {
+    const c = await getJSON('/api/csrf');
+    if (!c.csrf) throw new Error(c.error || 'no CSRF token');
+    const nonce = Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, '0')).join('');
+    const r = await fetch('/api/command', {
+      method: 'POST', cache: 'no-store', credentials: 'same-origin',
+      headers: {'Content-Type': 'application/json', 'X-Titan-CSRF': c.csrf},
+      body: JSON.stringify({kind: kind, confirm_text: confirmText, nonce: nonce}),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.error || 'HTTP ' + r.status);
+    msg.textContent = kind + ' queued as #' + d.cmd_id + '; its ack appears under Commands.' +
+      (botOffline ? ' The bot is OFFLINE: the command runs only when the bot starts. To act now, use the Kite app.' : '');
+    tab = 'commands';
+    markTabs();
+    poll();
+  } catch (e) {
+    msg.textContent = kind + ' NOT sent: ' + e.message;
+  }
+}
+
+async function poll() {
+  if (busy) return;
+  busy = true;
+  try {
+    const st = await getJSON('/api/status');
+    botOffline = st.offline !== false;
+    const banner = $('banner');
+    banner.hidden = !botOffline;
+    banner.textContent = botOffline ? (st.banner || OFFLINE_BANNER) + (st.error ? ' (' + st.error + ')' : '') : '';
+    document.body.classList.toggle('stale', botOffline);
+    if (isObj(st.data)) renderStatus(st.data);
+    else renderUnknown(st.error || 'no status');
+    if (Date.now() - tabLoadedAt >= (SLOW_TAB_MS[tab] || 0)) await loadTab();
+  } catch (e) {
+    botOffline = true;
+    $('banner').hidden = false;
+    $('banner').textContent = 'dashboard unreachable (' + e.message + '): bot status unknown — use the Kite app';
+    document.body.classList.add('stale');
+    renderUnknown('dashboard unreachable');
+  } finally {
+    busy = false;
+  }
+}
+
+function markTabs() {
+  for (const b of document.querySelectorAll('#tabs button')) b.classList.toggle('on', b.dataset.tab === tab);
+}
+
+for (const b of document.querySelectorAll('#tabs button')) {
+  b.addEventListener('click', () => {
+    tab = b.dataset.tab;
+    markTabs();
+    loadTab().catch((e) => { $('tab-note').textContent = e.message; });
+  });
+}
+$('pause').addEventListener('click', () => sendCommand('PAUSE', null));
+$('resume').addEventListener('click', () => {
+  if (confirm('RESUME clears the operator PAUSE (and a FLATTEN halt once the bot is flat). Continue?')) {
+    sendCommand('RESUME', null);
+  }
+});
+$('flatten').addEventListener('click', () => {
+  $('flatten-box').hidden = false;
+  $('flatten-text').value = '';
+  $('flatten-send').disabled = true;
+  $('flatten-text').focus();
+});
+$('flatten-text').addEventListener('input', () => {
+  $('flatten-send').disabled = $('flatten-text').value !== 'FLATTEN';          // the server checks it again
+});
+$('flatten-send').addEventListener('click', () => {
+  const typed = $('flatten-text').value;
+  $('flatten-box').hidden = true;
+  sendCommand('FLATTEN_ALL', typed);
+});
+$('flatten-cancel').addEventListener('click', () => { $('flatten-box').hidden = true; });
+$('detail-close').addEventListener('click', () => $('detail').close());
+setInterval(poll, POLL_MS);
+poll();
+</script>
+</body>
+</html>

@@ -1,0 +1,71 @@
+# titan2 keeps secrets and runtime state OUTSIDE the repository:
+#   laptop: %APPDATA%\titan2\titan2.env and dash.env (secrets), %LOCALAPPDATA%\titan2\var and \logs (state, logs)
+#   server: /etc/titan2/*.env (secrets), /var/lib/titan2 (state), /var/log/titan2 (logs)
+# These rules stop a stray copy from being committed. Never force-add (git add -f) anything they match.
+
+# --- Secrets ---------------------------------------------------------------------------------------------------
+titan2.env
+dash.env
+*.env
+.env
+.env.*
+!*.env.example
+.kite_access_token
+kite_session.json
+zerodha_token.json
+dhan_config.json
+*token*
+# ...but titan2's own code and the systemd units named after the token step are source, not secrets
+!*token*.py
+!ops/systemd/titan2-token.service
+!ops/systemd/titan2-token.timer
+*.pem
+*.key
+# A real Zerodha contract note holds your trades and client id: never commit one (tests/unit/fixtures has a placeholder)
+contract_note*.pdf
+
+# --- Runtime state, logs and reports ---------------------------------------------------------------------------
+var/
+logs/
+*.log
+*.log.[0-9]*
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite
+*.sqlite3
+reports/
+exports/
+# copies pulled from a server: ops/pull_drift.sh (./drift/) and ops/stage0_cutover.sh (./v1_archive/)
+drift/
+v1_archive/
+# backups and trade data
+*.tgz
+*.tar.gz
+*.jsonl
+*.jsonl.gz
+*.parquet
+*.pkl
+*.joblib
+
+# --- Python ------------------------------------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+venv*/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+.coverage
+htmlcov/
+
+# --- Editors and OS ----------------------------------------------------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

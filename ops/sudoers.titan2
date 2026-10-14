@@ -1,0 +1,25 @@
+# /etc/sudoers.d/titan2 - the deploy/operator allow-list (DETAIL 13.2, 13.6). Installed by ops/bootstrap.sh
+# (root:root 0440, checked with `visudo -cf` first). Every rule is NOPASSWD so scripts can use `sudo -n`.
+# User ubuntu deploys and operates; it must not be able to write /var/lib/titan2 or /etc/titan2. That holds only
+# once cloud-init's "ubuntu ALL=(ALL) NOPASSWD:ALL" is restricted (bootstrap.sh prints how): then everything not
+# listed here needs an interactive password, so no script can reach state or secrets by accident.
+
+# The titan2 CLI (/usr/local/bin/titan2), as user titan, from the current release.
+Cmnd_Alias TITAN2_CLI = /home/ubuntu/titan/current/venv/bin/python -m titan2 *
+
+# Deploy step 6: the new release's self-check, as titan, on an empty DB or on the deploy-time backup copy.
+Cmnd_Alias TITAN2_DEPLOY_CHECK = \
+    /home/ubuntu/titan/releases/*/venv/bin/python -m titan2 selfcheck --phase deploy, \
+    /home/ubuntu/titan/releases/*/venv/bin/python -m titan2 selfcheck --phase deploy --db-copy /var/lib/titan2/backups/deploy-*/titan2.db
+
+# Deploy steps 8-10 and the playbooks: titan2 unit files and the two titan2 services, nothing else.
+Cmnd_Alias TITAN2_UNITS = \
+    /usr/bin/install -m 0644 /home/ubuntu/titan/releases/*/ops/systemd/titan2-* /etc/systemd/system/titan2-*, \
+    /usr/bin/systemctl daemon-reload, \
+    /usr/bin/systemctl restart titan2-bot, /usr/bin/systemctl restart titan2-dash, \
+    /usr/bin/systemctl start titan2-bot, /usr/bin/systemctl stop titan2-bot, \
+    /usr/bin/systemctl reset-failed titan2-bot, /usr/bin/systemctl reset-failed titan2-dash, \
+    /usr/bin/systemctl set-environment TITAN2_SAFE=1, /usr/bin/systemctl unset-environment TITAN2_SAFE
+
+ubuntu ALL=(titan) NOPASSWD: TITAN2_CLI, TITAN2_DEPLOY_CHECK
+ubuntu ALL=(root) NOPASSWD: TITAN2_UNITS

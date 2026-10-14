@@ -1,0 +1,10 @@
+# titan2-selfcheck.timer: the morning self-check at 08:40 IST on weekdays (DETAIL §13.3, §13.10).
+[Unit]
+Description=Run the titan2 morning self-check on weekdays at 08:40 IST
+
+[Timer]
+OnCalendar=Mon..Fri 08:40 Asia/Kolkata
+Unit=titan2-selfcheck.service
+
+[Install]
+WantedBy=timers.target

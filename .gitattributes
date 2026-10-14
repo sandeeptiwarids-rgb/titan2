@@ -1,0 +1,4 @@
+# Store text files with LF and check them out with LF on every OS, Windows included (even with core.autocrlf=true),
+# so every clone has the bytes the tests ran on. The ops/ scripts run on Linux, and tests/ops check that ops/ holds
+# no CR byte; ops/.gitattributes keeps that rule for ops/ on its own.
+* text=auto eol=lf

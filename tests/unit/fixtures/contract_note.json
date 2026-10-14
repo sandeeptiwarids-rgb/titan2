@@ -1,0 +1,26 @@
+{
+  "placeholder": true,
+  "_comment": [
+    "PLACEHOLDER until open question Q5 is answered: replace with one real Zerodha F&O contract note dated on or after 2026-04-01 (STT 0.15%).",
+    "orders: one row per executed order on the note: side BUY|SELL, filled_qty in units, value = sum of price x qty of its trades, external_kind null (or AUTO_SQUAREOFF for a broker square-off order).",
+    "charges: the note's totals for those orders. brokerage = taxable value of supply (brokerage); txn = exchange transaction charges; gst = CGST + SGST + IGST; stt = securities transaction tax; sebi = SEBI turnover fees; stamp = stamp duty; ipft and sqoff_fee as printed (0 if absent).",
+    "Then set placeholder to false. tests/unit/test_charges.py::test_contract_note_fixture compares charges.net_pnl with these lines, within tolerance_rs_per_order per order (the CHARGES_DRIFT threshold); a failure means a new RateSet is needed."
+  ],
+  "trade_date": "2026-04-01",
+  "expect_rates_version": "2026-04-01",
+  "orders": [
+    {"order_id": "REPLACE_ME", "tradingsymbol": "REPLACE_ME", "side": "BUY", "filled_qty": 0, "value": 0.0, "external_kind": null},
+    {"order_id": "REPLACE_ME", "tradingsymbol": "REPLACE_ME", "side": "SELL", "filled_qty": 0, "value": 0.0, "external_kind": null}
+  ],
+  "charges": {
+    "brokerage": 0.0,
+    "stt": 0.0,
+    "txn": 0.0,
+    "sebi": 0.0,
+    "ipft": 0.0,
+    "gst": 0.0,
+    "stamp": 0.0,
+    "sqoff_fee": 0.0
+  },
+  "tolerance_rs_per_order": 1.0
+}

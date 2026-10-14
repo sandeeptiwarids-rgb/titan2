@@ -1,0 +1,11 @@
+# titan2-backup.timer: after the session on weekdays (16:10 IST) and on Saturday at 03:00 IST (DETAIL §13.3, §13.8).
+[Unit]
+Description=Run the titan2 backup at 16:10 IST on weekdays and 03:00 IST on Saturday
+
+[Timer]
+OnCalendar=Mon..Fri 16:10 Asia/Kolkata
+OnCalendar=Sat 03:00 Asia/Kolkata
+Unit=titan2-backup.service
+
+[Install]
+WantedBy=timers.target

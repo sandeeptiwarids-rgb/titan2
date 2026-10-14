@@ -1,0 +1,20 @@
+# titan2: pytest configuration only (spec §2). Runtime dependencies are pinned in requirements.lock.
+#
+# Run from agentic_trader/:  python -m pytest tests -q -p no:cacheprovider
+# Chaos seeds: 200 by default (CI); the nightly job sets TITAN2_CHAOS_SEEDS=500.
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+# "." makes titan2 importable; "tests" makes the harness importable as the top-level package `fakes` (a site
+# `tests` package can shadow tests.fakes, so the harness is never imported through the tests namespace).
+pythonpath = [".", "tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "scenario: end-to-end scenario run on both accounts through the ScenarioRunner (tests/scenarios)",
+    "chaos: seeded random fault sequences checked against the chaos invariants (tests/chaos)",
+    "arch: static architecture rules over titan2/ (tests/arch)",
+]
+filterwarnings = [
+    "ignore:datetime.datetime.utcfromtimestamp:DeprecationWarning",
+]

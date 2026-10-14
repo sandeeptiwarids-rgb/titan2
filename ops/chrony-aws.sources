@@ -1,0 +1,4 @@
+# /etc/chrony/sources.d/titan2-aws.sources - installed by ops/bootstrap.sh. The Amazon Time Sync Service, reachable
+# from every EC2 instance at this link-local address [V: `chronyc sources` shows it as the selected source].
+# The self-check requires `timedatectl show -p NTPSynchronized --value` = yes (DETAIL 13.7).
+server 169.254.169.123 prefer iburst minpoll 4 maxpoll 4

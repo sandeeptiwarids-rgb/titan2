@@ -1,0 +1,27 @@
+# titan2-backup.service: daily backups (DETAIL §13.8) through ops/backup.sh: SQLite online copies of the four
+# databases, integrity-checked and gzipped, plus settings.json, into /var/backups/titan2/YYYY-MM-DD/; keeps 30 daily
+# and 12 monthly sets; optional S3 copy (BACKUP_S3_URI). No EnvironmentFile: the backup holds no credentials
+# (backup.sh reads only BACKUP_S3_URI from titan2.env). Secrets are never copied.
+[Unit]
+Description=titan2 backup (SQLite online copies, never secrets)
+OnFailure=titan2-alert@%n.service
+
+[Service]
+Type=oneshot
+User=titan
+Group=titan
+UMask=0077
+WorkingDirectory=/home/ubuntu/titan/agentic_trader
+Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 TZ=Asia/Kolkata TITAN2_VAR=/var/lib/titan2
+# Through bash: a release keeps git's file modes, and a script committed from Windows has no exec bit.
+ExecStart=/bin/bash /home/ubuntu/titan/current/ops/backup.sh
+TimeoutStartSec=1800
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+# db/: SQLite must create titan2.db's -shm/-wal to read it while the bot is not running; backups/: deploy-* pruning.
+ReadWritePaths=/var/backups/titan2 /var/lib/titan2/db /var/lib/titan2/backups
+SyslogIdentifier=titan2-backup

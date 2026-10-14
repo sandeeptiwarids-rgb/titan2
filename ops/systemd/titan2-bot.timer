@@ -1,0 +1,13 @@
+# titan2-bot.timer: start the daily run at 08:45 IST on weekdays (DETAIL §13.3, §13.10). The bot checks the NSE
+# session calendar itself (holidays, special sessions) and exits 0 when there is nothing to trade.
+# Persistent=true: a host that was down at 08:45 starts the bot as soon as it boots.
+[Unit]
+Description=Start titan2-bot on weekdays at 08:45 IST
+
+[Timer]
+OnCalendar=Mon..Fri 08:45 Asia/Kolkata
+Persistent=true
+Unit=titan2-bot.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,892 @@
+{
+  "area": "select_strike",
+  "format": 1,
+  "v1": {
+    "rev": "b4694f3",
+    "tag": "v1-final",
+    "files": {
+      "options_trader.py": {
+        "blob": "45eab1b6eb822a0c6da67c300fa44b093f0c3143",
+        "spans": {
+          "OptionChain": [2740, 2775],
+          "OptionChainFetcher.select_strike": [3497, 3550],
+          "OptionContract": [2718, 2737],
+          "OptionType": [2695, 2698],
+          "StrikeSelection": [2701, 2707]
+        }
+      }
+    }
+  },
+  "driver": "v1 select_strike(chain, CE|PE, ATM|ITM_1) on a one-expiry chain built from the listed strikes",
+  "chains": {
+    "STOCK_STEP50": [2300.0, 2350.0, 2400.0, 2450.0, 2500.0, 2550.0, 2600.0, 2650.0, 2700.0],
+    "NIFTY_STEP50": [24800.0, 24850.0, 24900.0, 24950.0, 25000.0, 25050.0, 25100.0, 25150.0, 25200.0],
+    "STOCK_MIXED_STEP": [90.0, 92.5, 95.0, 97.5, 100.0, 105.0, 110.0, 115.0, 120.0]
+  },
+  "cases": [
+    {
+      "id": "STOCK_STEP50@2463.4/CE/ATM",
+      "chain": "STOCK_STEP50",
+      "spot": 2463.4,
+      "opt_type": "CE",
+      "pref": "ATM",
+      "expect": "SAME",
+      "v1": {"strike": 2450.0, "atm_strike": 2450.0}
+    },
+    {
+      "id": "STOCK_STEP50@2463.4/CE/ITM1",
+      "chain": "STOCK_STEP50",
+      "spot": 2463.4,
+      "opt_type": "CE",
+      "pref": "ITM1",
+      "expect": "SAME",
+      "v1": {"strike": 2400.0, "atm_strike": 2450.0}
+    },
+    {
+      "id": "STOCK_STEP50@2463.4/PE/ATM",
+      "chain": "STOCK_STEP50",
+      "spot": 2463.4,
+      "opt_type": "PE",
+      "pref": "ATM",
+      "expect": "SAME",
+      "v1": {"strike": 2450.0, "atm_strike": 2450.0}
+    },
+    {
+      "id": "STOCK_STEP50@2463.4/PE/ITM1",
+      "chain": "STOCK_STEP50",
+      "spot": 2463.4,
+      "opt_type": "PE",
+      "pref": "ITM1",
+      "expect": "SAME",
+      "v1": {"strike": 2500.0, "atm_strike": 2450.0}
+    },
+    {
+      "id": "STOCK_STEP50@2512/CE/ATM",
+      "chain": "STOCK_STEP50",
+      "spot": 2512.0,
+      "opt_type": "CE",
+      "pref": "ATM",
+      "expect": "SAME",
+      "v1": {"strike": 2500.0, "atm_strike": 2500.0}
+    },
+    {
+      "id": "STOCK_STEP50@2512/CE/ITM1",
+      "chain": "STOCK_STEP50",
+      "spot": 2512.0,
+      "opt_type": "CE",
+      "pref": "ITM1",
+      "expect": "SAME",
+      "v1": {"strike": 2450.0, "atm_strike": 2500.0}
+    },
+    {
+      "id": "STOCK_STEP50@2512/PE/ATM",
+      "chain": "STOCK_STEP50",
+      "spot": 2512.0,
+      "opt_type": "PE",
+      "pref": "ATM",
+      "expect": "SAME",
+      "v1": {"strike": 2500.0, "atm_strike": 2500.0}
+    },
+    {
+      "id": "STOCK_STEP50@2512/PE/ITM1",
+      "chain": "STOCK_STEP50",
+      "spot": 2512.0,
+      "opt_type": "PE",
+      "pref": "ITM1",
+      "expect": "SAME",
+      "v1": {"strike": 2550.0, "atm_strike": 2500.0}
+    },
+    {
+      "id": "STOCK_STEP50@2549.9/CE/ATM",
+      "chain": "STOCK_STEP50",
+      "spot": 2549.9,
+      "opt_type": "CE",
+      "pref": "ATM",
+      "expect": "SAME",
+      "v1": {"strike": 2550.0, "atm_strike": 2550.0}
+    },
+    {
+      "id": "STOCK_STEP50@2549.9/CE/ITM1",
+      "chain": "STOCK_STEP50",
+      "spot": 2549.9,
+      "opt_type": "CE",
+      "pref": "ITM1",
+      "expect": "SAME",
+      "v1": {"strike": 2500.0, "atm_strike": 2550.0}
+    },
+    {
+      "id": "STOCK_STEP50@2549.9/PE/ATM",
+      "chain": "STOCK_STEP50",
+      "spot": 2549.9,
+      "opt_type": "PE",
+      "pref": "ATM",
+      "expect": "SAME",
+      "v1": {"strike": 2550.0, "atm_strike": 2550.0}
+    },
+    {
+      "id": "STOCK_STEP50@2549.9/PE/ITM1",
+      "chain": "STOCK_STEP50",
+      "spot": 2549.9,
+      "opt_type": "PE",
+      "pref": "ITM1",
+      "expect": "SAME",
+      "v1": {"strike": 2600.0, "atm_strike": 2550.0}
+    },
+    {
+      "id": "STOCK_STEP50@2401/CE/ATM",
+      "chain": "STOCK_STEP50",
+      "spot": 2401.0,
+      "opt_type": "CE",
+      "pref": "ATM",
+      "expect": "SAME",
+      "v1": {"strike": 2400.0, "atm_strike": 2400.0}
+    },
+    {
+      "id": "STOCK_STEP50@2401/CE/ITM1",
+      "chain": "STOCK_STEP50",
+      "spot": 2401.0,
+      "opt_type": "CE",
+      "pref": "ITM1",
+      "expect": "SAME",
+      "v1": {"strike": 2350.0, "atm_strike": 2400.0}
+    },
+    {
+      "id": "STOCK_STEP50@2401/PE/ATM",
+      "chain": "STOCK_STEP50",
+      "spot": 2401.0,
+      "opt_type": "PE",
+      "pref": "ATM",
+      "expect": "SAME",
+      "v1": {"strike": 2400.0, "atm_strike": 2400.0}
+    },
+    {
+      "id": "STOCK_STEP50@2401/PE/ITM1",
+      "chain": "STOCK_STEP50",
+      "spot": 2401.0,
+      "opt_type": "PE",
+      "pref": "ITM1",
+      "expect": "SAME",
+      "v1": {"strike": 2450.0, "atm_strike": 2400.0}
+    },
+    {
+      "id": "STOCK_STEP50@2624.95/CE/ATM",
+      "chain": "STOCK_STEP50",
+      "spot": 2624.95,
+      "opt_type": "CE",
+      "pref": "ATM",
+      "expect": "SAME",
+      "v1": {"strike": 2600.0, "atm_strike": 2600.0}
+    },
+    {
+      "id": "STOCK_STEP50@2624.95/CE/ITM1",
+      "chain": "STOCK_STEP50",
+      "spot": 2624.95,
+      "opt_type": "CE",
+      "pref": "ITM1",
+      "expect": "SAME",
+      "v1": {"strike": 2550.0, "atm_strike": 2600.0}
+    },
+    {
+      "id": "STOCK_STEP50@2624.95/PE/ATM",
+      "chain": "STOCK_STEP50",
+      "spot": 2624.95,
+      "opt_type": "PE",
+      "pref": "ATM",
+      "expect": "SAME",
+      "v1": {"strike": 2600.0, "atm_strike": 2600.0}
+    },
+    {
+      "id": "STOCK_STEP50@2624.95/PE/ITM1",
+      "chain": "STOCK_STEP50",
+      "spot": 2624.95,
+      "opt_type": "PE",
+      "pref": "ITM1",
+      "expect": "SAME",
+      "v1": {"strike": 2650.0, "atm_strike": 2600.0}
+    },
+    {
+      "id": "STOCK_STEP50@2475/CE/ATM",
+      "chain": "STOCK_STEP50",
+      "spot": 2475.0,
+      "opt_type": "CE",
+      "pref": "ATM",
+      "expect": "SAME",
+      "v1": {"strike": 2450.0, "atm_strike": 2450.0}
+    },
+    {
+      "id": "STOCK_STEP50@2475/CE/ITM1",
+      "chain": "STOCK_STEP50",
+      "spot": 2475.0,
+      "opt_type": "CE",
+      "pref": "ITM1",
+      "expect": "SAME",
+      "v1": {"strike": 2400.0, "atm_strike": 2450.0}
+    },
+    {
+      "id": "STOCK_STEP50@2475/PE/ATM",
+      "chain": "STOCK_STEP50",
+      "spot": 2475.0,
+      "opt_type": "PE",
+      "pref": "ATM",
+      "expect": "D_ATM_TIE_PE_MORE_ITM",
+      "v1": {"strike": 2450.0, "atm_strike": 2450.0}
+    },
+    {
+      "id": "STOCK_STEP50@2475/PE/ITM1",
+      "chain": "STOCK_STEP50",
+      "spot": 2475.0,
+      "opt_type": "PE",
+      "pref": "ITM1",
+      "expect": "D_ATM_TIE_PE_MORE_ITM",
+      "v1": {"strike": 2500.0, "atm_strike": 2450.0}
+    },
+    {
+      "id": "STOCK_STEP50@2310/CE/ATM",
+      "chain": "STOCK_STEP50",
+      "spot": 2310.0,
+      "opt_type": "CE",
+      "pref": "ATM",
+      "expect": "SAME",
+      "v1": {"strike": 2300.0, "atm_strike": 2300.0}
+    },
+    {
+      "id": "STOCK_STEP50@2310/CE/ITM1",
+      "chain": "STOCK_STEP50",
+      "spot": 2310.0,
+      "opt_type": "CE",
+      "pref": "ITM1",
+      "expect": "D_ITM1_EDGE_REFUSED",
+      "v1": {"strike": 2300.0, "atm_strike": 2300.0}
+    },
+    {
+      "id": "STOCK_STEP50@2310/PE/ATM",
+      "chain": "STOCK_STEP50",
+      "spot": 2310.0,
+      "opt_type": "PE",
+      "pref": "ATM",
+      "expect": "SAME",
+      "v1": {"strike": 2300.0, "atm_strike": 2300.0}
+    },
+    {
+      "id": "STOCK_STEP50@2310/PE/ITM1",
+      "chain": "STOCK_STEP50",
+      "spot": 2310.0,
+      "opt_type": "PE",
+      "pref": "ITM1",
+      "expect": "SAME",
+      "v1": {"strike": 2350.0, "atm_strike": 2300.0}
+    },
+    {
+      "id": "STOCK_STEP50@2290/CE/ATM",
+      "chain": "STOCK_STEP50",
+      "spot": 2290.0,
+      "opt_type": "CE",
+      "pref": "ATM",
+      "expect": "SAME",
+      "v1": {"strike": 2300.0, "atm_strike": 2300.0}
+    },
+    {
+      "id": "STOCK_STEP50@2290/CE/ITM1",
+      "chain": "STOCK_STEP50",
+      "spot": 2290.0,
+      "opt_type": "CE",
+      "pref": "ITM1",
+      "expect": "D_ITM1_EDGE_REFUSED",
+      "v1": {"strike": 2300.0, "atm_strike": 2300.0}
+    },
+    {
+      "id": "STOCK_STEP50@2290/PE/ATM",
+      "chain": "STOCK_STEP50",
+      "spot": 2290.0,
+      "opt_type": "PE",
+      "pref": "ATM",
+      "expect": "SAME",
+      "v1": {"strike": 2300.0, "atm_strike": 2300.0}
+    },
+    {
+      "id": "STOCK_STEP50@2290/PE/ITM1",
+      "chain": "STOCK_STEP50",
+      "spot": 2290.0,
+      "opt_type": "PE",
+      "pref": "ITM1",
+      "expect": "SAME",
+      "v1": {"strike": 2350.0, "atm_strike": 2300.0}
+    },
+    {
+      "id": "STOCK_STEP50@2695/CE/ATM",
+      "chain": "STOCK_STEP50",
+      "spot": 2695.0,
+      "opt_type": "CE",
+      "pref": "ATM",
+      "expect": "SAME",
+      "v1": {"strike": 2700.0, "atm_strike": 2700.0}
+    },
+    {
+      "id": "STOCK_STEP50@2695/CE/ITM1",
+      "chain": "STOCK_STEP50",
+      "spot": 2695.0,
+      "opt_type": "CE",
+      "pref": "ITM1",
+      "expect": "SAME",
+      "v1": {"strike": 2650.0, "atm_strike": 2700.0}
+    },
+    {
+      "id": "STOCK_STEP50@2695/PE/ATM",
+      "chain": "STOCK_STEP50",
+      "spot": 2695.0,
+      "opt_type": "PE",
+      "pref": "ATM",
+      "expect": "SAME",
+      "v1": {"strike": 2700.0, "atm_strike": 2700.0}
+    },
+    {
+      "id": "STOCK_STEP50@2695/PE/ITM1",
+      "chain": "STOCK_STEP50",
+      "spot": 2695.0,
+      "opt_type": "PE",
+      "pref": "ITM1",
+      "expect": "D_ITM1_EDGE_REFUSED",
+      "v1": {"strike": 2700.0, "atm_strike": 2700.0}
+    },
+    {
+      "id": "STOCK_STEP50@2712/CE/ATM",
+      "chain": "STOCK_STEP50",
+      "spot": 2712.0,
+      "opt_type": "CE",
+      "pref": "ATM",
+      "expect": "SAME",
+      "v1": {"strike": 2700.0, "atm_strike": 2700.0}
+    },
+    {
+      "id": "STOCK_STEP50@2712/CE/ITM1",
+      "chain": "STOCK_STEP50",
+      "spot": 2712.0,
+      "opt_type": "CE",
+      "pref": "ITM1",
+      "expect": "SAME",
+      "v1": {"strike": 2650.0, "atm_strike": 2700.0}
+    },
+    {
+      "id": "STOCK_STEP50@2712/PE/ATM",
+      "chain": "STOCK_STEP50",
+      "spot": 2712.0,
+      "opt_type": "PE",
+      "pref": "ATM",
+      "expect": "SAME",
+      "v1": {"strike": 2700.0, "atm_strike": 2700.0}
+    },
+    {
+      "id": "STOCK_STEP50@2712/PE/ITM1",
+      "chain": "STOCK_STEP50",
+      "spot": 2712.0,
+      "opt_type": "PE",
+      "pref": "ITM1",
+      "expect": "D_ITM1_EDGE_REFUSED",
+      "v1": {"strike": 2700.0, "atm_strike": 2700.0}
+    },
+    {
+      "id": "STOCK_STEP50@2270/CE/ATM",
+      "chain": "STOCK_STEP50",
+      "spot": 2270.0,
+      "opt_type": "CE",
+      "pref": "ATM",
+      "expect": "D_SPOT_OUTSIDE_REFUSED",
+      "v1": {"strike": 2300.0, "atm_strike": 2300.0}
+    },
+    {
+      "id": "STOCK_STEP50@2270/CE/ITM1",
+      "chain": "STOCK_STEP50",
+      "spot": 2270.0,
+      "opt_type": "CE",
+      "pref": "ITM1",
+      "expect": "D_SPOT_OUTSIDE_REFUSED",
+      "v1": {"strike": 2300.0, "atm_strike": 2300.0}
+    },
+    {
+      "id": "STOCK_STEP50@2270/PE/ATM",
+      "chain": "STOCK_STEP50",
+      "spot": 2270.0,
+      "opt_type": "PE",
+      "pref": "ATM",
+      "expect": "D_SPOT_OUTSIDE_REFUSED",
+      "v1": {"strike": 2300.0, "atm_strike": 2300.0}
+    },
+    {
+      "id": "STOCK_STEP50@2270/PE/ITM1",
+      "chain": "STOCK_STEP50",
+      "spot": 2270.0,
+      "opt_type": "PE",
+      "pref": "ITM1",
+      "expect": "D_SPOT_OUTSIDE_REFUSED",
+      "v1": {"strike": 2350.0, "atm_strike": 2300.0}
+    },
+    {
+      "id": "STOCK_STEP50@2740/CE/ATM",
+      "chain": "STOCK_STEP50",
+      "spot": 2740.0,
+      "opt_type": "CE",
+      "pref": "ATM",
+      "expect": "D_SPOT_OUTSIDE_REFUSED",
+      "v1": {"strike": 2700.0, "atm_strike": 2700.0}
+    },
+    {
+      "id": "STOCK_STEP50@2740/CE/ITM1",
+      "chain": "STOCK_STEP50",
+      "spot": 2740.0,
+      "opt_type": "CE",
+      "pref": "ITM1",
+      "expect": "D_SPOT_OUTSIDE_REFUSED",
+      "v1": {"strike": 2650.0, "atm_strike": 2700.0}
+    },
+    {
+      "id": "STOCK_STEP50@2740/PE/ATM",
+      "chain": "STOCK_STEP50",
+      "spot": 2740.0,
+      "opt_type": "PE",
+      "pref": "ATM",
+      "expect": "D_SPOT_OUTSIDE_REFUSED",
+      "v1": {"strike": 2700.0, "atm_strike": 2700.0}
+    },
+    {
+      "id": "STOCK_STEP50@2740/PE/ITM1",
+      "chain": "STOCK_STEP50",
+      "spot": 2740.0,
+      "opt_type": "PE",
+      "pref": "ITM1",
+      "expect": "D_SPOT_OUTSIDE_REFUSED",
+      "v1": {"strike": 2700.0, "atm_strike": 2700.0}
+    },
+    {
+      "id": "NIFTY_STEP50@25012.3/CE/ATM",
+      "chain": "NIFTY_STEP50",
+      "spot": 25012.35,
+      "opt_type": "CE",
+      "pref": "ATM",
+      "expect": "SAME",
+      "v1": {"strike": 25000.0, "atm_strike": 25000.0}
+    },
+    {
+      "id": "NIFTY_STEP50@25012.3/CE/ITM1",
+      "chain": "NIFTY_STEP50",
+      "spot": 25012.35,
+      "opt_type": "CE",
+      "pref": "ITM1",
+      "expect": "SAME",
+      "v1": {"strike": 24950.0, "atm_strike": 25000.0}
+    },
+    {
+      "id": "NIFTY_STEP50@25012.3/PE/ATM",
+      "chain": "NIFTY_STEP50",
+      "spot": 25012.35,
+      "opt_type": "PE",
+      "pref": "ATM",
+      "expect": "SAME",
+      "v1": {"strike": 25000.0, "atm_strike": 25000.0}
+    },
+    {
+      "id": "NIFTY_STEP50@25012.3/PE/ITM1",
+      "chain": "NIFTY_STEP50",
+      "spot": 25012.35,
+      "opt_type": "PE",
+      "pref": "ITM1",
+      "expect": "SAME",
+      "v1": {"strike": 25050.0, "atm_strike": 25000.0}
+    },
+    {
+      "id": "NIFTY_STEP50@24987.7/CE/ATM",
+      "chain": "NIFTY_STEP50",
+      "spot": 24987.65,
+      "opt_type": "CE",
+      "pref": "ATM",
+      "expect": "SAME",
+      "v1": {"strike": 25000.0, "atm_strike": 25000.0}
+    },
+    {
+      "id": "NIFTY_STEP50@24987.7/CE/ITM1",
+      "chain": "NIFTY_STEP50",
+      "spot": 24987.65,
+      "opt_type": "CE",
+      "pref": "ITM1",
+      "expect": "SAME",
+      "v1": {"strike": 24950.0, "atm_strike": 25000.0}
+    },
+    {
+      "id": "NIFTY_STEP50@24987.7/PE/ATM",
+      "chain": "NIFTY_STEP50",
+      "spot": 24987.65,
+      "opt_type": "PE",
+      "pref": "ATM",
+      "expect": "SAME",
+      "v1": {"strike": 25000.0, "atm_strike": 25000.0}
+    },
+    {
+      "id": "NIFTY_STEP50@24987.7/PE/ITM1",
+      "chain": "NIFTY_STEP50",
+      "spot": 24987.65,
+      "opt_type": "PE",
+      "pref": "ITM1",
+      "expect": "SAME",
+      "v1": {"strike": 25050.0, "atm_strike": 25000.0}
+    },
+    {
+      "id": "NIFTY_STEP50@25025/CE/ATM",
+      "chain": "NIFTY_STEP50",
+      "spot": 25025.0,
+      "opt_type": "CE",
+      "pref": "ATM",
+      "expect": "SAME",
+      "v1": {"strike": 25000.0, "atm_strike": 25000.0}
+    },
+    {
+      "id": "NIFTY_STEP50@25025/CE/ITM1",
+      "chain": "NIFTY_STEP50",
+      "spot": 25025.0,
+      "opt_type": "CE",
+      "pref": "ITM1",
+      "expect": "SAME",
+      "v1": {"strike": 24950.0, "atm_strike": 25000.0}
+    },
+    {
+      "id": "NIFTY_STEP50@25025/PE/ATM",
+      "chain": "NIFTY_STEP50",
+      "spot": 25025.0,
+      "opt_type": "PE",
+      "pref": "ATM",
+      "expect": "D_ATM_TIE_PE_MORE_ITM",
+      "v1": {"strike": 25000.0, "atm_strike": 25000.0}
+    },
+    {
+      "id": "NIFTY_STEP50@25025/PE/ITM1",
+      "chain": "NIFTY_STEP50",
+      "spot": 25025.0,
+      "opt_type": "PE",
+      "pref": "ITM1",
+      "expect": "D_ATM_TIE_PE_MORE_ITM",
+      "v1": {"strike": 25050.0, "atm_strike": 25000.0}
+    },
+    {
+      "id": "NIFTY_STEP50@24815/CE/ATM",
+      "chain": "NIFTY_STEP50",
+      "spot": 24815.0,
+      "opt_type": "CE",
+      "pref": "ATM",
+      "expect": "SAME",
+      "v1": {"strike": 24800.0, "atm_strike": 24800.0}
+    },
+    {
+      "id": "NIFTY_STEP50@24815/CE/ITM1",
+      "chain": "NIFTY_STEP50",
+      "spot": 24815.0,
+      "opt_type": "CE",
+      "pref": "ITM1",
+      "expect": "D_ITM1_EDGE_REFUSED",
+      "v1": {"strike": 24800.0, "atm_strike": 24800.0}
+    },
+    {
+      "id": "NIFTY_STEP50@24815/PE/ATM",
+      "chain": "NIFTY_STEP50",
+      "spot": 24815.0,
+      "opt_type": "PE",
+      "pref": "ATM",
+      "expect": "SAME",
+      "v1": {"strike": 24800.0, "atm_strike": 24800.0}
+    },
+    {
+      "id": "NIFTY_STEP50@24815/PE/ITM1",
+      "chain": "NIFTY_STEP50",
+      "spot": 24815.0,
+      "opt_type": "PE",
+      "pref": "ITM1",
+      "expect": "SAME",
+      "v1": {"strike": 24850.0, "atm_strike": 24800.0}
+    },
+    {
+      "id": "NIFTY_STEP50@25190/CE/ATM",
+      "chain": "NIFTY_STEP50",
+      "spot": 25190.0,
+      "opt_type": "CE",
+      "pref": "ATM",
+      "expect": "SAME",
+      "v1": {"strike": 25200.0, "atm_strike": 25200.0}
+    },
+    {
+      "id": "NIFTY_STEP50@25190/CE/ITM1",
+      "chain": "NIFTY_STEP50",
+      "spot": 25190.0,
+      "opt_type": "CE",
+      "pref": "ITM1",
+      "expect": "SAME",
+      "v1": {"strike": 25150.0, "atm_strike": 25200.0}
+    },
+    {
+      "id": "NIFTY_STEP50@25190/PE/ATM",
+      "chain": "NIFTY_STEP50",
+      "spot": 25190.0,
+      "opt_type": "PE",
+      "pref": "ATM",
+      "expect": "SAME",
+      "v1": {"strike": 25200.0, "atm_strike": 25200.0}
+    },
+    {
+      "id": "NIFTY_STEP50@25190/PE/ITM1",
+      "chain": "NIFTY_STEP50",
+      "spot": 25190.0,
+      "opt_type": "PE",
+      "pref": "ITM1",
+      "expect": "D_ITM1_EDGE_REFUSED",
+      "v1": {"strike": 25200.0, "atm_strike": 25200.0}
+    },
+    {
+      "id": "STOCK_MIXED_STEP@99.1/CE/ATM",
+      "chain": "STOCK_MIXED_STEP",
+      "spot": 99.1,
+      "opt_type": "CE",
+      "pref": "ATM",
+      "expect": "SAME",
+      "v1": {"strike": 100.0, "atm_strike": 100.0}
+    },
+    {
+      "id": "STOCK_MIXED_STEP@99.1/CE/ITM1",
+      "chain": "STOCK_MIXED_STEP",
+      "spot": 99.1,
+      "opt_type": "CE",
+      "pref": "ITM1",
+      "expect": "SAME",
+      "v1": {"strike": 97.5, "atm_strike": 100.0}
+    },
+    {
+      "id": "STOCK_MIXED_STEP@99.1/PE/ATM",
+      "chain": "STOCK_MIXED_STEP",
+      "spot": 99.1,
+      "opt_type": "PE",
+      "pref": "ATM",
+      "expect": "SAME",
+      "v1": {"strike": 100.0, "atm_strike": 100.0}
+    },
+    {
+      "id": "STOCK_MIXED_STEP@99.1/PE/ITM1",
+      "chain": "STOCK_MIXED_STEP",
+      "spot": 99.1,
+      "opt_type": "PE",
+      "pref": "ITM1",
+      "expect": "SAME",
+      "v1": {"strike": 105.0, "atm_strike": 100.0}
+    },
+    {
+      "id": "STOCK_MIXED_STEP@101.2/CE/ATM",
+      "chain": "STOCK_MIXED_STEP",
+      "spot": 101.2,
+      "opt_type": "CE",
+      "pref": "ATM",
+      "expect": "SAME",
+      "v1": {"strike": 100.0, "atm_strike": 100.0}
+    },
+    {
+      "id": "STOCK_MIXED_STEP@101.2/CE/ITM1",
+      "chain": "STOCK_MIXED_STEP",
+      "spot": 101.2,
+      "opt_type": "CE",
+      "pref": "ITM1",
+      "expect": "SAME",
+      "v1": {"strike": 97.5, "atm_strike": 100.0}
+    },
+    {
+      "id": "STOCK_MIXED_STEP@101.2/PE/ATM",
+      "chain": "STOCK_MIXED_STEP",
+      "spot": 101.2,
+      "opt_type": "PE",
+      "pref": "ATM",
+      "expect": "SAME",
+      "v1": {"strike": 100.0, "atm_strike": 100.0}
+    },
+    {
+      "id": "STOCK_MIXED_STEP@101.2/PE/ITM1",
+      "chain": "STOCK_MIXED_STEP",
+      "spot": 101.2,
+      "opt_type": "PE",
+      "pref": "ITM1",
+      "expect": "SAME",
+      "v1": {"strike": 105.0, "atm_strike": 100.0}
+    },
+    {
+      "id": "STOCK_MIXED_STEP@103/CE/ATM",
+      "chain": "STOCK_MIXED_STEP",
+      "spot": 103.0,
+      "opt_type": "CE",
+      "pref": "ATM",
+      "expect": "SAME",
+      "v1": {"strike": 105.0, "atm_strike": 105.0}
+    },
+    {
+      "id": "STOCK_MIXED_STEP@103/CE/ITM1",
+      "chain": "STOCK_MIXED_STEP",
+      "spot": 103.0,
+      "opt_type": "CE",
+      "pref": "ITM1",
+      "expect": "SAME",
+      "v1": {"strike": 100.0, "atm_strike": 105.0}
+    },
+    {
+      "id": "STOCK_MIXED_STEP@103/PE/ATM",
+      "chain": "STOCK_MIXED_STEP",
+      "spot": 103.0,
+      "opt_type": "PE",
+      "pref": "ATM",
+      "expect": "SAME",
+      "v1": {"strike": 105.0, "atm_strike": 105.0}
+    },
+    {
+      "id": "STOCK_MIXED_STEP@103/PE/ITM1",
+      "chain": "STOCK_MIXED_STEP",
+      "spot": 103.0,
+      "opt_type": "PE",
+      "pref": "ITM1",
+      "expect": "SAME",
+      "v1": {"strike": 110.0, "atm_strike": 105.0}
+    },
+    {
+      "id": "STOCK_MIXED_STEP@102.5/CE/ATM",
+      "chain": "STOCK_MIXED_STEP",
+      "spot": 102.5,
+      "opt_type": "CE",
+      "pref": "ATM",
+      "expect": "SAME",
+      "v1": {"strike": 100.0, "atm_strike": 100.0}
+    },
+    {
+      "id": "STOCK_MIXED_STEP@102.5/CE/ITM1",
+      "chain": "STOCK_MIXED_STEP",
+      "spot": 102.5,
+      "opt_type": "CE",
+      "pref": "ITM1",
+      "expect": "SAME",
+      "v1": {"strike": 97.5, "atm_strike": 100.0}
+    },
+    {
+      "id": "STOCK_MIXED_STEP@102.5/PE/ATM",
+      "chain": "STOCK_MIXED_STEP",
+      "spot": 102.5,
+      "opt_type": "PE",
+      "pref": "ATM",
+      "expect": "D_ATM_TIE_PE_MORE_ITM",
+      "v1": {"strike": 100.0, "atm_strike": 100.0}
+    },
+    {
+      "id": "STOCK_MIXED_STEP@102.5/PE/ITM1",
+      "chain": "STOCK_MIXED_STEP",
+      "spot": 102.5,
+      "opt_type": "PE",
+      "pref": "ITM1",
+      "expect": "D_ATM_TIE_PE_MORE_ITM",
+      "v1": {"strike": 105.0, "atm_strike": 100.0}
+    },
+    {
+      "id": "STOCK_MIXED_STEP@96.25/CE/ATM",
+      "chain": "STOCK_MIXED_STEP",
+      "spot": 96.25,
+      "opt_type": "CE",
+      "pref": "ATM",
+      "expect": "SAME",
+      "v1": {"strike": 95.0, "atm_strike": 95.0}
+    },
+    {
+      "id": "STOCK_MIXED_STEP@96.25/CE/ITM1",
+      "chain": "STOCK_MIXED_STEP",
+      "spot": 96.25,
+      "opt_type": "CE",
+      "pref": "ITM1",
+      "expect": "SAME",
+      "v1": {"strike": 92.5, "atm_strike": 95.0}
+    },
+    {
+      "id": "STOCK_MIXED_STEP@96.25/PE/ATM",
+      "chain": "STOCK_MIXED_STEP",
+      "spot": 96.25,
+      "opt_type": "PE",
+      "pref": "ATM",
+      "expect": "D_ATM_TIE_PE_MORE_ITM",
+      "v1": {"strike": 95.0, "atm_strike": 95.0}
+    },
+    {
+      "id": "STOCK_MIXED_STEP@96.25/PE/ITM1",
+      "chain": "STOCK_MIXED_STEP",
+      "spot": 96.25,
+      "opt_type": "PE",
+      "pref": "ITM1",
+      "expect": "D_ATM_TIE_PE_MORE_ITM",
+      "v1": {"strike": 97.5, "atm_strike": 95.0}
+    },
+    {
+      "id": "STOCK_MIXED_STEP@91/CE/ATM",
+      "chain": "STOCK_MIXED_STEP",
+      "spot": 91.0,
+      "opt_type": "CE",
+      "pref": "ATM",
+      "expect": "SAME",
+      "v1": {"strike": 90.0, "atm_strike": 90.0}
+    },
+    {
+      "id": "STOCK_MIXED_STEP@91/CE/ITM1",
+      "chain": "STOCK_MIXED_STEP",
+      "spot": 91.0,
+      "opt_type": "CE",
+      "pref": "ITM1",
+      "expect": "D_ITM1_EDGE_REFUSED",
+      "v1": {"strike": 90.0, "atm_strike": 90.0}
+    },
+    {
+      "id": "STOCK_MIXED_STEP@91/PE/ATM",
+      "chain": "STOCK_MIXED_STEP",
+      "spot": 91.0,
+      "opt_type": "PE",
+      "pref": "ATM",
+      "expect": "SAME",
+      "v1": {"strike": 90.0, "atm_strike": 90.0}
+    },
+    {
+      "id": "STOCK_MIXED_STEP@91/PE/ITM1",
+      "chain": "STOCK_MIXED_STEP",
+      "spot": 91.0,
+      "opt_type": "PE",
+      "pref": "ITM1",
+      "expect": "SAME",
+      "v1": {"strike": 92.5, "atm_strike": 90.0}
+    },
+    {
+      "id": "STOCK_MIXED_STEP@124/CE/ATM",
+      "chain": "STOCK_MIXED_STEP",
+      "spot": 124.0,
+      "opt_type": "CE",
+      "pref": "ATM",
+      "expect": "D_SPOT_OUTSIDE_REFUSED",
+      "v1": {"strike": 120.0, "atm_strike": 120.0}
+    },
+    {
+      "id": "STOCK_MIXED_STEP@124/CE/ITM1",
+      "chain": "STOCK_MIXED_STEP",
+      "spot": 124.0,
+      "opt_type": "CE",
+      "pref": "ITM1",
+      "expect": "D_SPOT_OUTSIDE_REFUSED",
+      "v1": {"strike": 115.0, "atm_strike": 120.0}
+    },
+    {
+      "id": "STOCK_MIXED_STEP@124/PE/ATM",
+      "chain": "STOCK_MIXED_STEP",
+      "spot": 124.0,
+      "opt_type": "PE",
+      "pref": "ATM",
+      "expect": "D_SPOT_OUTSIDE_REFUSED",
+      "v1": {"strike": 120.0, "atm_strike": 120.0}
+    },
+    {
+      "id": "STOCK_MIXED_STEP@124/PE/ITM1",
+      "chain": "STOCK_MIXED_STEP",
+      "spot": 124.0,
+      "opt_type": "PE",
+      "pref": "ITM1",
+      "expect": "D_SPOT_OUTSIDE_REFUSED",
+      "v1": {"strike": 120.0, "atm_strike": 120.0}
+    }
+  ]
+}

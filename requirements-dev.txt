@@ -1,0 +1,28 @@
+# titan2 development and CI dependencies, hash-locked. Install everything with
+#   python -m pip install --require-hashes -r requirements-dev.txt
+# (the -r line below pulls in the runtime lock, so versions are shared and pinned once).
+#
+# Direct requirement: pytest==7.4.4 (the version the suite was tested with). Only packages that
+# are not already in requirements.lock are listed here.
+# Generated 2026-10-11 from PyPI with uv 0.10.6 (--universal --python-version 3.10
+# --generate-hashes), constrained to the requirements.lock pins.
+-r requirements.lock
+
+exceptiongroup==1.3.0 ; python_full_version < '3.11' \
+    --hash=sha256:4d111e6e0c13d0644cad6ddaa7ed0261a0b36971f6d23e7ec9b4b9097da78a10 \
+    --hash=sha256:b241f5885f560bc56a59ee63ca4c6a8bfa46ae4ad651af316d4e81817bb9fd88
+    # via
+    #   pytest
+iniconfig==2.1.0 \
+    --hash=sha256:3abbd2e30b36733fee78f9c7f7308f2d0050e88f0087fd25c2645f63c773e1c7 \
+    --hash=sha256:9deba5723312380e77435581c6bf4935c94cbfab9b1ed33ef8d238ea168eb760
+    # via
+    #   pytest
+pluggy==1.6.0 \
+    --hash=sha256:7dcc130b76258d33b90f61b658791dede3486c3e6bfb003ee5c9bfb396dd22f3 \
+    --hash=sha256:e920276dd6813095e9377c0bc5566d94c932c33b27a3e3945d8389c374dd4746
+    # via
+    #   pytest
+pytest==7.4.4 \
+    --hash=sha256:2cf0005922c6ace4a3e2ec8b4080eb0d9753fdc93107415332f50ce9e7994280 \
+    --hash=sha256:b090cdf5ed60bf4c45261be03239c2c1c22df034fbffe691abe93cd80cea01d8

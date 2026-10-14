@@ -1,0 +1,12 @@
+# titan2-token.timer: refresh the Kite session at 08:30 IST on weekdays (DETAIL §13.3, §13.10). Persistent=true:
+# a host that was down at 08:30 refreshes as soon as it boots.
+[Unit]
+Description=Refresh the titan2 Kite session on weekdays at 08:30 IST
+
+[Timer]
+OnCalendar=Mon..Fri 08:30 Asia/Kolkata
+Persistent=true
+Unit=titan2-token.service
+
+[Install]
+WantedBy=timers.target

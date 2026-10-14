@@ -1,0 +1,7 @@
+#!/bin/sh
+# /usr/local/bin/titan2: the titan2 CLI for the operator and the ops scripts (DETAIL §13.2). Installed by
+# ops/bootstrap.sh (root:root 0755). It runs the current release as user titan from the bot's WorkingDirectory, so
+# `python -m titan2` resolves through agentic_trader/titan2 -> ../current/titan2. ops/sudoers.titan2 allows exactly
+# this command; -n makes a missing rule fail at once instead of prompting. The CLI reads /etc/titan2/titan2.env
+# itself (sudo resets the environment). Examples: titan2 status, titan2 pause, titan2 flatten-all --confirm FLATTEN.
+cd /home/ubuntu/titan/agentic_trader && exec sudo -n -u titan /home/ubuntu/titan/current/venv/bin/python -m titan2 "$@"
