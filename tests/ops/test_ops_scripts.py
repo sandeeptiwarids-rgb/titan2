@@ -571,7 +571,9 @@ def test_backup_retention_and_s3(server):
     fakepy.write_text('#!/usr/bin/env bash\necho "fakepy $*" >> "$FAKE_LOG"\n'
                       '[ "$1 $2 $3 $4" = "-m titan2 backup --to" ] && [ "$6" = --gzip ] || exit 9\n'
                       'mkdir -p "$5" && echo db | gzip > "$5/titan2.db.gz"\n', newline="\n")
+    fakepy.chmod(0o755)                     # Linux runs only executable files; Windows never checks
     (srv.bin / "aws").write_text('#!/usr/bin/env bash\necho "aws $*" >> "$FAKE_LOG"\n', newline="\n")
+    (srv.bin / "aws").chmod(0o755)
     (srv.etc / "titan2.env").write_text("ZERODHA_API_SECRET=not-for-backups\nBACKUP_S3_URI='s3://bucket/titan2/'\n")
     env = {"TITAN2_APP_DIR": bpath(srv.tmp), "TITAN2_PYTHON": bpath(fakepy), "TITAN2_BACKUP_DIR": bpath(broot),
            "TITAN2_ENV_FILE": bpath(srv.etc / "titan2.env")}
