@@ -176,9 +176,10 @@ queue per account, and shows the ledger at that moment, so an exit that waits fo
 costs paper what it costs LIVE. Orders and fills live in the paper exchange's own `paper_exchange.db`. The PAPER
 account has one pool of `PAPER_CAPITAL_RS`, like the one LIVE account; on SHADOW every book (`SHADOW:<s>`,
 `PLACEBO:<s>`) has its own, so one book can never starve another. The broker's MIS square-off is simulated at
-`BROKER_SQUAREOFF_AT` (it takes the whole book, and any remainder fills 5% worse than the deepest level; a book that
-stays crossed or locked for 1.5 s is taken at its worse side, a sell never above the best ask), and a position left
-from an earlier session is squared off at ₹0.05 at startup: the worst case, on purpose.
+`BROKER_SQUAREOFF_AT` (it takes the whole book, and any remainder fills 5% worse than the deepest level; if the only
+book that comes in its 1.5 s wait is crossed or locked, that book is taken at its worse side, a sell never above the
+best ask, however early in the wait it came), and a position left from an earlier session is squared off at ₹0.05
+at startup: the worst case, on purpose.
 
 **Rate limits** (shared, blocking, never fail open): orders 8/s burst 3; quotes 1 call/s; historical 3/s; others 8/s.
 Reads are served by priority: EXIT > ENTRY_LIVE > RECON > PAPER > SHADOW > BACKGROUND. A quote request that waits
@@ -226,21 +227,21 @@ docstring is its detailed reference.
 | `titan2/data/nse_sessions.json` | Trading hours, holidays and special sessions |
 | `titan2/ledger.py` | The immutable trade row, the daily report, the `pub/` and export files |
 | `titan2/g1.py` | G1 trials, looks, bootstrap, placebo, futility, certificate, live review and demotion |
-| `titan2/alerts.py` | Telegram, healthchecks dead-man, dedup and repeating CRITICAL alerts |
+| `titan2/alerts.py` | Telegram and ntfy, healthchecks dead-man, dedup and repeating CRITICAL alerts; a message the network keeps from going out is kept (200 messages, 2 h) and resent after one `ALERTS_DELAYED` line, and what is undelivered at a stop is sent at the next start (`var/run/alerts_outbox.json`) |
 | `titan2/token.py` | The Kite session file, headless TOTP login, manual request-token exchange |
 | `titan2/selfcheck.py` | Self-check phases: morning, prestart, deploy, cutover, and laptop (its own rows, `LAPTOP_CHECKS`) |
-| `titan2/laptop.py` | Laptop mode (Windows, PAPER only, §14): the profile, the Windows paths, keep-awake and power, the clock and network probes, the two-stage Ctrl+C and the day runner behind `titan2 laptop` |
-| `titan2/net.py` | `force_ipv4()`: every process's Kite REST calls go over IPv4 only (`TITAN2_IPV6=1` turns it off); `tcp_probe()` for the laptop's `network` self-check row |
-| `titan2/condor.py` | `titan2 condor`: the PAPER NIFTY weekly 1.5-SD iron condor tracker (edge_research_verdict.md's paper spec). No order path: reads Kite quotes, day bars and basket margins, books paper fills, 3x-credit stop, expiry settlement and the kill rules in its own `db/condor.db`; the laptop runs it at 15:25 (`laptop.Supervisor`) |
+| `titan2/laptop.py` | Laptop mode (Windows, PAPER only, §14): the profile, the Windows paths, keep-awake and power (a switch to battery reaches the phone), the clock and network probes, the probes of the laptop settings that can end a session (lid, pending restart, update hours, auto-connecting Wi-Fi), the two-stage Ctrl+C, the start card's text and the day runner behind `titan2 laptop` (crash restarts and the give-up reach the phone) |
+| `titan2/net.py` | `force_ipv4()`: every process's Kite REST calls go over IPv4 only (`TITAN2_IPV6=1` turns it off), and a failed DNS lookup connects to the host's last good IPv4 address (`remember_ipv4()`; TLS still checks the name); `tcp_probe()` for the laptop's `network` self-check row |
+| `titan2/condor.py` | `titan2 condor`: the PAPER NIFTY weekly 1.5-SD iron condor tracker (edge_research_verdict.md's paper spec). No order path: reads Kite quotes, day bars and basket margins, books paper fills, 3x-credit stop (a crossed or locked leg is tried again, then valued at its worse side), expiry settlement and the kill rules in its own `db/condor.db`; the laptop runs it at 15:25 (`laptop.Supervisor`), and each start writes a MISSED note for every 15:25 duty skipped while titan2 was not running |
 | `titan2/whatif.py` | `titan2 whatif`: replays a session's refused entries (ENTRY_REFUSED events) on Kite minute bars under the strategy's exit rules, after charges; read-only, writes `reports/whatif-<date>.json` (research aid; the laptop runs it after each session) |
 | `titan2/market/__init__.py` | Market-data package (imports nothing) |
 | `titan2/market/quotes.py` | `QuoteCache`: newest snapshot per symbol; `fresh()` never returns a stale quote |
 | `titan2/market/feed.py` | KiteTicker wrapper: subscriptions through `reactor.callFromThread`, ticks, order updates, feed health |
-| `titan2/market/bars.py` | 5-minute bars from ticks, previous-session bars, the live-vs-historical bar check |
+| `titan2/market/bars.py` | 5-minute bars from ticks, previous-session bars, the live-vs-historical bar check (its detail keeps both volumes, signed, and the pre-open volume) |
 | `titan2/broker/__init__.py` | Broker package (imports nothing heavy) |
 | `titan2/broker/port.py` | The `BrokerPort` / `DataPort` contracts and the result vocabulary |
 | `titan2/broker/kite.py` | `KiteBroker` (LIVE orders, LIMIT/IOC/MIS only) and `KiteData` (reads only; one retry of a quote read whose connection dropped); error classes |
-| `titan2/broker/lanes.py` | The order lane, the reads lane (batching, priority) and the token buckets |
+| `titan2/broker/lanes.py` | The order lane, the reads lane (batching, priority; the quote thread keeps Kite's connection warm from 09:00 to 15:30 with a throwaway `ltp()` after 60 s without a quote call, and measures every call it makes: `QuoteCall`) and the token buckets |
 | `titan2/broker/paper.py` | `PaperExchange` and `fill_from_depth()`: fills, own ledger, square-off simulation |
 | `titan2/core/__init__.py` | Core package |
 | `titan2/core/events.py` | The events into the core and the commands out of it |
@@ -478,8 +479,10 @@ restart). Defaults are the loosest allowed values: you can only tighten. The key
 exchange (every `PAPER_*` key but `PAPER_CAPITAL_RS`) are fixed at their defaults (paper model 2): calibration is a
 code decision, and for the delays and the participation no side is safe (a slower or a faster delay, or a lower
 participation, each makes paper look better than LIVE in some case). A file that sets one to anything but its
-default is invalid; changing one is a code change with a `PAPER_MODEL_VERSION` bump. A versioned key (`yes` below) is
-part of every strategy's version, so changing it starts new G1 trials.
+default is invalid; changing one is a code change with a `PAPER_MODEL_VERSION` bump. An invalid file is repaired one
+key at a time with `titan2 settings unset KEY` (or a `set` to a valid value): a change that removes some of its
+problems and adds none is written and says what is still wrong, and the bot stays on the defaults until the file is
+valid. A versioned key (`yes` below) is part of every strategy's version, so changing it starts new G1 trials.
 
 <!-- settings-table:start (generated from titan2.settings.LIMITS; tests/unit/test_docs.py) -->
 | Key | Default | Allowed | Safer | Versioned |
@@ -803,11 +806,31 @@ over 30 days). v1's `titan_state.db` is never opened.
 the sum of its fills, kept independently of the engine so reconciliation is a real check.
 
 **`pub/`**, the only thing the dashboard reads: `status.json` (every second), `trades_today.json`, `trades_90d.json`,
-`trade/<id>.json` (orders, fills, 1-minute bid path), `events_tail.json`, `g1.json`, `acks.json`.
+`trade/<id>.json` (orders, fills, 1-minute bid path), `events_tail.json` (the last 500 events without the DEBUG rows:
+the minute's heartbeats and measurements stay in `titan2.db` and the exports), `g1.json`, `acks.json`.
 
 **Outputs**: `reports/<date>.md` (daily report, also on Telegram), `reports/selfcheck-*.json`,
 `exports/{events,trades}/<date>.jsonl.gz`, `/var/log/titan2/bot.log`, `quote_checks` HOLD rows (each check) and POST
 rows (45 minutes of bid path after every exit, for offline exit research).
+
+**Measurements** (2026-10-14 night; information only, nothing decides on them). Every call of the quote client is
+measured: the whole call (the wait for the 1-a-second token included), Kite's own answer time, the symbols, the
+seconds since the previous call (60 s or more: cold), a dropped-connection retry and the outcome; one INFO
+`quote call:` line each in the log file (kept off the laptop's console). Every broker read's round trip (the engine's
+send to its answer) is kept per account and kind. Both go into one DEBUG `LATENCY` event a minute, with the
+heartbeat, and the daily report's latency table gets `quote_call_ms`, `quote_kite_ms` and `read_ms:<ACCOUNT>:<KIND>`
+rows (n, p50, p95, max) and a line with the cold share, failures, retries and keep-warm calls. A paper fill's log
+line names the book it filled on (WS or REST, receipt and exchange time, its age at the due time, the wait past due,
+the levels to the limit, the order's draw). The first bars' pre-open volume (the cumulative volume at a stock's last
+tick before 09:15:00) is a DEBUG `PREOPEN_VOLUME` event, and the 15:36 bar check stores it in `bar_checks.detail`
+with both volumes as they are (`live_volume`, `kite_volume`, the signed `volume_gap` and `volume_rel`, and
+`volume_rel_ex_preopen`), so the next morning shows whether Kite's 09:15 candle leaves the pre-open auction out.
+
+**The 15:38 phone report** (DAILY_REPORT) gives, besides the books (placebo books labelled as control trades), the
+halts and each strategy's G1 line: the day's refusals and voids by reason, the what-if totals saved so far (today's
+runs after the session), the paper condor (laptop), the bar check with its reasons, the alerts delayed or not
+delivered this run, and on each G1 line "today counts for G1: yes" or "no (why)": a mode G1 does not test, no
+running trial, a PAPER mismatch today, or an IMPAIRED mark.
 
 **Env keys** (`/etc/titan2/titan2.env`, written by hand from `ops/titan2.env.example`, never in git): `ZERODHA_API_KEY`,
 `ZERODHA_API_SECRET`, `ZERODHA_USER_ID`, `ZERODHA_PASSWORD`, `ZERODHA_TOTP_SECRET`, `TOKEN_MODE` (auto or manual),
@@ -907,9 +930,28 @@ with `ops/windows/setup.ps1`, then every trading morning start `ops/windows/run_
   any login), the Kite session (today's file, else the TOTP login, else a pasted request token), the laptop
   self-check, the bot session (recovery first, exits resume before READY; restarted in-process on exit 75, and up to
   5 times on exit 3), the bot's own EOD timeline, the daily report, exit.
+- **On the phone.** Once the bot's own laptop self-check after prep is done (its signals start then), one INFO
+  `START_CARD` (once a session, from its first run that gets that far, not again after an in-process restart):
+  PAPER only, every FAIL and WARN row, the clock, network and power rows, each strategy's mode and version, and the
+  PAPER condor (with its last close and the latest missed 15:25 duty, as in the 15:38 report); a quiet day sends
+  nothing else, so no card by 09:15 means titan2 is not running.
+  Each crash restart is a WARN `BOT_RESTARTED` (sent by the restarted bot), a controlled restart (exit 75) an INFO
+  one, and the give-up after the fifth crash restart a CRITICAL `BOT_GAVE_UP` (open positions not managed; it also
+  pings the dead-man's `/fail`). A switch from AC to battery is a WARN `POWER` (the source is looked at every 30 s),
+  and back on AC after it one INFO; a new IMPAIRED mark a WARN `SESSION_IMPAIRED`; a placebo's opened and closed
+  alerts begin "control trade (placebo), not a strategy result"; and the LIVE account's read warnings (`READ_LOST`,
+  `STALE_RECON`) say "Kite account check (no LIVE trading here)", since no LIVE order leaves the laptop.
 - **Self-check phase `laptop`** (`titan2 laptop check` runs it alone; in the bot it replaces `prestart`): rows
   `python`, `env_file`, `token`, `clock`, `network`, `calendar`, `instruments`, `disk`, `db`, `settings`, `power`,
-  `live_disabled`, instead of the systemd, users, v1 and egress-IP rows. A FAIL halts entries and never exits.
+  `lid`, `restart_pending`, `update_hours`, `wifi`, `notify`, `live_disabled`, instead of the systemd, users, v1 and
+  egress-IP rows. A FAIL halts entries and never exits.
+  `notify` (WARN only, no alert of its own) reads the phone alerts' setup (`NTFY_TOPIC` or Telegram) and
+  `HEALTHCHECK_URL` (no dead-man without it) and sends no test message.
+  `lid`, `restart_pending`, `update_hours` and `wifi` (WARN only, no alert of their own: the start card lists them;
+  SKIP when the setting cannot be read; all read as a standard user) find the laptop settings that can end a session:
+  closing the lid sleeps the laptop when plugged in (`powercfg /qh SCHEME_CURRENT SUB_BUTTONS LIDACTION`), Windows
+  Update waits for a restart (its `RebootRequired` registry key), its active hours leave part of 08:00-16:00 open to
+  a restart, more than one saved Wi-Fi network connects automatically (`netsh wlan show profiles`; never a key).
   `network` (WARN only) times 8 IPv4 TCP connects to api.kite.trade: a lost or slow connect means Kite timeouts,
   i.e. entries refused as QUOTE:FETCH_FAILED. Every titan2 process sends Kite REST over IPv4 (titan2/net.py).
   `clock` blocks entries (CLOCK_UNSYNCED) when titan2's clock can be more than 1 s off internet time, the reading's

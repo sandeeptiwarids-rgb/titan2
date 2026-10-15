@@ -11,6 +11,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sqlite3
 import stat
 import subprocess
@@ -246,8 +247,8 @@ def test_healthcheck_gated():
     assert quiet.step() == []
 
 
-def _cron_ticks(day: date) -> list[datetime]:
-    """Every tick of alerts.DEADMAN_SCHEDULE on day (fields '*', 'n' or 'a-b'; weekdays only)."""
+def _cron_ticks(day: date, schedule: tuple[str, ...] = alerts.DEADMAN_SCHEDULE) -> list[datetime]:
+    """Every tick of schedule (alerts.DEADMAN_SCHEDULE by default) on day (fields '*', 'n' or 'a-b'; weekdays only)."""
     def field(spec: str, lo: int, hi: int) -> range:
         if spec == "*":
             return range(lo, hi + 1)
@@ -255,7 +256,7 @@ def _cron_ticks(day: date) -> list[datetime]:
         return range(int(a), int(b or a) + 1)
 
     out = []
-    for line in alerts.DEADMAN_SCHEDULE:
+    for line in schedule:
         minute, hour, dom, month, dow = line.split()
         assert (dom, month, dow) == ("*", "*", "1-5"), line
         if day.weekday() < 5:
@@ -263,16 +264,20 @@ def _cron_ticks(day: date) -> list[datetime]:
     return sorted(out)
 
 
-def deadman_down(pings: list[datetime], day: date) -> list[str]:
-    """When a healthchecks cron check on DEADMAN_SCHEDULE would go DOWN on day, given the pings it received: after a
-    ping at p the next ping is due by the first tick after p plus the grace (the day starts as if pinged at 00:00)."""
-    ticks = _cron_ticks(day)
+def deadman_down(pings: list[datetime], day: date, schedule: tuple[str, ...] = alerts.DEADMAN_SCHEDULE,
+                 paused_at: datetime | None = None) -> list[str]:
+    """When a healthchecks cron check on schedule (DEADMAN_SCHEDULE by default) would go DOWN on day, given the pings
+    it received: after a ping at p the next ping is due by the first tick after p plus the grace (the day starts as
+    if pinged at 00:00). paused_at: the owner pauses the check then (its Pause button); a paused check never goes
+    DOWN, and the next ping resumes it (healthchecks.io's default), as if it were an ordinary ping."""
+    ticks = _cron_ticks(day, schedule)
     grace = timedelta(minutes=alerts.DEADMAN_GRACE_MIN)
     down = []
     last = datetime.combine(day, dtime(0, 0), IST)
     for p in sorted(pings) + [datetime.combine(day + timedelta(days=1), dtime(0, 0), IST)]:
         due = next((t for t in ticks if t > last), None)
-        if due is not None and p > due + grace:
+        paused = paused_at is not None and last < paused_at < p and due is not None and paused_at <= due + grace
+        if due is not None and p > due + grace and not paused:
             down.append(f"after {last:%H:%M:%S} the {due:%H:%M} tick needs a ping by {due + grace:%H:%M} "
                         f"(next ping {p:%H:%M:%S})")
         last = p
@@ -320,6 +325,82 @@ def test_deadman_schedule_matches_the_bots_day():
             clock.advance(1.0)
         assert stamps and stamps[-1] >= exit_at
         assert deadman_down(stamps, day) == [], (sq, deadman_down(stamps, day))
+
+
+def _laptop_pings(day: date, start: dtime, to_ready_min: float, stop: dtime) -> list[datetime]:
+    """When the bot's alerter pings the dead-man on a laptop day started by hand at `start`: from READY, to_ready_min
+    after it (the login, the self-check and the recovery come first), until a stop at `stop` (the EOD exit, or a
+    Ctrl+C), with one last ping as the stop begins."""
+    clock = FakeClock(datetime.combine(day, start, IST) + timedelta(minutes=to_ready_min))
+    hb, hc = alerts.Heartbeat(), FakeHC()
+    a = alerts.Alerter(None, hc, hb, clock=clock, sleep=lambda s: None)
+    stamps: list[datetime] = []
+    original = hc.ping
+
+    def ping(signal: str = "", body: str = "") -> None:
+        original(signal, body)
+        stamps.append(clock.now_wall())
+
+    hc.ping = ping
+    hb.core_progress(clock.mono())
+    a.ping_ready()
+    end = datetime.combine(day, stop, IST)
+    while clock.now_wall() < end:
+        hb.core_progress(clock.mono())
+        a.step()
+        clock.advance(5.0)
+    a.ping_now()
+    for _ in range(3):
+        a.step()
+        clock.advance(1.0)
+    return stamps
+
+
+def test_the_laptops_deadman_schedule_fits_a_start_by_hand():
+    """Review round 5: docs/LAPTOP.md recommended the server's schedule, whose first tick is 08:45 (the server's bot
+    starts by itself at 08:45). The laptop is started by hand between 08:40 and 09:10 and pings first at READY, a few
+    minutes after the start, so a 09:05 start went DOWN at 08:48 and rang the phone, then UP again at READY. The
+    laptop's own schedule, alerts.LAPTOP_DEADMAN_SCHEDULE, begins at 09:15: a start by 09:10 with up to 5 minutes to
+    READY never goes DOWN up to the EOD exit at 15:40. A stop before its last tick (15:33) still goes DOWN, which is
+    why the docs say to pause the check when stopping early. Review round 6: they said to pause it before the stop,
+    but titan2 pings while it stops (through the Ctrl+C flatten, and once more as it exits) and a ping resumes a
+    paused check, which then rang 3 to 4 minutes after the exit. docs/LAPTOP.md section 4 now says to pause it after
+    titan2 has stopped, within a time read here from it and played on the schedule, at the worst second of a minute:
+    the window's `titan2 stopped cleanly` comes within about 20 s of the exit's ping (the alerts' flush, then the
+    supervisor, the condor job and the dashboard stop), or, when that ping is skipped (the threads took over 10 s to
+    stop, so the core heartbeat was stale), within about 95 s of the minute's ping before it."""
+    day = date(2026, 10, 12)                                      # a Monday session
+    laptop_schedule = alerts.LAPTOP_DEADMAN_SCHEDULE
+    assert laptop_schedule[-1] == alerts.DEADMAN_SCHEDULE[-1]       # it ends as the server's
+    assert _cron_ticks(day, laptop_schedule)[0] == datetime.combine(day, dtime(9, 15), IST)
+    for start in (dtime(8, 40), dtime(9, 0), dtime(9, 10)):
+        pings = _laptop_pings(day, start, 5.0, dtime(15, 40))
+        assert deadman_down(pings, day, laptop_schedule) == [], (start, deadman_down(pings, day, laptop_schedule))
+    late = _laptop_pings(day, dtime(9, 5), 1.0, dtime(15, 40))
+    assert deadman_down(late, day)[0].startswith("after 00:00:00 the 08:45 tick needs a ping by 08:48")   # the old
+    early = _laptop_pings(day, dtime(8, 40), 2.0, dtime(14, 46))
+    assert deadman_down(early, day, laptop_schedule)                # a Ctrl+C at 14:46 rings unless it is paused
+    within = _documented_pause_after_a_stop()
+    ctrl_c = datetime.combine(day, dtime(14, 45), IST)
+    for start in (dtime(8, 40), dtime(9, 0, 58)):                 # its pings at :00, or at :58 of each minute
+        for stop in (dtime(14, 46), dtime(14, 46, 30), dtime(14, 46, 57)):     # the flatten and the clean exit
+            pings = _laptop_pings(day, start, 2.0, stop)
+            assert [p for p in pings if p > ctrl_c] and deadman_down(pings, day, laptop_schedule), (start, stop)
+            assert deadman_down(pings, day, laptop_schedule, paused_at=ctrl_c), (start, stop)    # the old advice
+            for kept, line_after_s in ((pings, 20.0), (pings[:-1], 95.0)):
+                paused = kept[-1] + timedelta(seconds=line_after_s) + within
+                assert deadman_down(kept, day, laptop_schedule, paused_at=paused) == [], (start, stop, paused)
+            assert deadman_down(pings, day, laptop_schedule, paused_at=pings[-1] + timedelta(minutes=5))   # late
+
+
+def _documented_pause_after_a_stop() -> timedelta:
+    """How soon docs/LAPTOP.md section 4 says to pause the dead-man check after an early stop: "once the window says
+    `titan2 stopped cleanly`, within a minute" (or "within N minutes")."""
+    text = " ".join((Path(__file__).resolve().parents[2] / "docs" / "LAPTOP.md").read_text(encoding="utf-8").split())
+    m = re.search(r"\*\*The dead-man check\.\*\* [^*]*? after titan2 has stopped: once the window says `titan2 stopped "
+                  r"cleanly`, within (a|\d+) minutes?\b", text)
+    assert m, "docs/LAPTOP.md section 4 says nothing on when to pause the dead-man check after an early stop"
+    return timedelta(minutes=1 if m.group(1) == "a" else int(m.group(1)))
 
 
 def test_weekday_holiday_keeps_the_deadman_fed(tmp_path, monkeypatch):

@@ -552,6 +552,56 @@ def test_unset_repairs_an_invalid_file(tmp_path):
     assert p.read_text(encoding="utf-8") == "{oops"
 
 
+def test_a_file_with_several_now_fixed_paper_keys_is_repaired_one_key_at_a_time(tmp_path):
+    """Review round 4 (probe test_probe_unset_two_fixed_keys): paper model 2 fixed the paper calibration keys at their
+    defaults, and the CHANGELOG's remedy for a file that sets one is `titan2 settings unset KEY`. With two such keys
+    neither `unset` nor `set KEY <default>` could write: each validated the whole result, and removing one key left
+    the other's error. A change to a file that is already invalid is now written when it removes some of its problems
+    and adds none; the message lists what is left, and the bot stays on the code defaults until the last one."""
+    p = write(tmp_path / "settings.json", {"PAPER_LATENCY_MEDIAN_MS": 300.0, "PAPER_LATENCY_SIGMA": 0.8,
+                                           "MAX_ENTRIES_PER_DAY": 2})
+    loaded = st.load(p)
+    assert not loaded.valid and len(loaded.errors) == 2               # both were valid before paper model 2
+    (sigma,) = [e for e in loaded.errors if e.startswith("PAPER_LATENCY_SIGMA: 0.8 is not 0.6 (fixed")]
+    r = st.unset_setting("PAPER_LATENCY_MEDIAN_MS", p)
+    assert r.changed and r.still_invalid == (sigma,) and not r.versioned and r.after == DEFAULTS
+    assert (r.old, r.new) == (250.0, 250.0)
+    assert "the file is still invalid" in r.message() and r.message().endswith(sigma)
+    assert json.loads(p.read_text(encoding="utf-8")) == {"PAPER_LATENCY_SIGMA": 0.8, "MAX_ENTRIES_PER_DAY": 2}
+    assert st.load(p).errors == (sigma,)
+    r = st.set_setting("PAPER_LATENCY_SIGMA", "0.6", p)                 # `set KEY <default>` repairs the last one
+    assert r.changed and r.still_invalid == () and "still invalid" not in r.message()
+    assert r.versioned and "new version" in r.message()                  # MAX_ENTRIES_PER_DAY 2 now applies
+    loaded = st.load(p)
+    assert loaded.valid and loaded.settings.MAX_ENTRIES_PER_DAY == 2 and loaded.settings.PAPER_LATENCY_SIGMA == 0.6
+    assert sorted(x.name for x in tmp_path.iterdir()) == ["settings.json"]
+    # the same two keys alone: the last repair leaves the defaults the bot ran on meanwhile, so no new versions
+    write(p, {"PAPER_LATENCY_MEDIAN_MS": 300.0, "PAPER_LATENCY_SIGMA": 0.8})
+    assert st.unset_setting("PAPER_LATENCY_SIGMA", p).still_invalid[0].startswith("PAPER_LATENCY_MEDIAN_MS: 300.0")
+    r = st.unset_setting("PAPER_LATENCY_MEDIAN_MS", p)
+    assert r.changed and not r.versioned and "new version" not in r.message() and r.after == DEFAULTS
+    assert json.loads(p.read_text(encoding="utf-8")) == {} and st.load(p).valid
+
+
+def test_a_change_to_an_invalid_file_must_remove_a_problem_and_add_none(tmp_path):
+    p = write(tmp_path / "settings.json", {"PAPER_LATENCY_SIGMA": 0.8, "STALE_PROTECTIVE_S": 9.0})
+    before = p.read_bytes()
+    for key, value in [("PAPER_LATENCY_SIGMA", "0.9"),     # another wrong value: no problem removed
+                       ("MAX_LOTS", "0"),                   # another key: waits for a valid file, as before
+                       ("ENTRY_START", "15:00"),            # a new problem between keys, behind the old ones
+                       ("STALE_PROTECTIVE_S", "2.0")]:      # cures its bound, breaks the rule with STALE_REFRESH_S
+        with pytest.raises(SettingsError) as info:
+            st.set_setting(key, value, p)
+        assert info.value.errors[-1].endswith("is already invalid: a change is written only when it removes one of "
+                                              "its problems and adds none (`titan2 settings unset KEY` removes a key)")
+        assert p.read_bytes() == before, key
+    r = st.set_setting("STALE_PROTECTIVE_S", "4.0", p)
+    assert r.new == 4.0 and r.still_invalid == (st.load(p).errors[0],) and st.load(p).errors[0].startswith(
+        "PAPER_LATENCY_SIGMA: 0.8")
+    assert json.loads(p.read_text(encoding="utf-8")) == {"PAPER_LATENCY_SIGMA": 0.8, "STALE_PROTECTIVE_S": 4.0}
+    assert st.unset_setting("PAPER_LATENCY_SIGMA", p).after.STALE_PROTECTIVE_S == 4.0 and st.load(p).valid
+
+
 def test_code_constants_and_semantic_hash():
     # PAPER_MODEL_VERSION 2: paper model v2 (2026-10-14, the seeded fraction of a lot and the unusable fill books);
     #   ENGINE_SEMANTICS_VERSION 2 in the same release (the pending-entry wait, the quote retry, rounds 2-3's fixes)

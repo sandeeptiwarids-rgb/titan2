@@ -288,7 +288,9 @@ titan2 settings diff
 takes effect at the next restart: restart after the close (`sudo systemctl restart titan2-bot`). A versioned key
 gives every strategy a new version, so new G1 trials start. A looser value is refused: that needs a code change,
 review, tests and a deploy. A file broken by hand makes the bot run on the defaults under HALT SETTINGS_INVALID until
-a valid file and a restart.
+a valid file and a restart. An invalid file, say one setting several keys a release has since fixed, is repaired one
+key at a time: each `titan2 settings unset KEY`, or `set` to a valid value, that removes some of its problems and adds
+none is written, and its message lists what is still wrong; any other change is refused until the file is valid.
 
 ### P14. LIVE unlock and rollback to PAPER
 
@@ -333,14 +335,22 @@ Telegram messages read `[titan2] <SEVERITY> <CODE>`. A CRITICAL repeats every 5 
 message ends with the exact command, `titan2 ack-alert <key>`. A WARN is sent at most once per 30 minutes per key.
 Every halt also sends `HALT_<KIND>` (CRITICAL for the dangerous kinds): see [§6](#6-halts). Self-check rows send
 `SELFCHECK_<ROW>`: see [§7](#7-morning-self-check). Acknowledging an alert only stops the repeats; it clears nothing.
+A message the network keeps from going out (no DNS, no connection, a timeout, or HTTP 429/5xx) is kept, up to 200
+messages for up to 2 hours, and tried again every 30 s; when it goes through, one `ALERTS_DELAYED` line ("network
+back at HH:MM:SS after N s; K alerts delayed", or "rate limit (HTTP 429) over at ..." when the service only limited
+the rate) comes first, then the kept messages with the time each was raised; a 429 while they go out only makes
+them wait 10 s, with no new line. Until the kept messages are all out, a CRITICAL's repeats pause. A stop gives the
+message being sent its retries until the stop's deadline; what is still undelivered then, that message included, is
+sent at the next start (`var/run/alerts_outbox.json`).
 
 **CRITICAL**
 
 | Code | Meaning | Do |
 |---|---|---|
-| `BOT_CRASHED` | The bot process crashed; systemd restarts it (exit 3) and recovery resumes the exits | Watch for READY; if it repeats → [P1](#p1-bot-down-with-positions-open); report the traceback |
+| `BOT_CRASHED` | The bot process crashed; systemd restarts it (exit 3; on the laptop its runner does, up to 5 times: `BOT_RESTARTED`) and recovery resumes the exits | Watch for READY; if it repeats → [P1](#p1-bot-down-with-positions-open); report the traceback |
+| `BOT_GAVE_UP` | Laptop: titan2 crashed 6 times (exit 3) and its runner stopped restarting it: open positions are not managed. Also pings the dead-man's `/fail`; kept for the next start when the network is down | Read the laptop log, then start `run_today.ps1` again at once: recovery resumes the exits ([P1](#p1-bot-down-with-positions-open)); report the traceback |
 | `BOT_KILLED` | At this start, the previous run had died during the session without a clean exit (a watchdog SIGABRT, an out-of-memory kill, SIGKILL or a host failure; its BOOT event has no SHUTDOWN). The text says when it was last alive; this start's recovery resumes the exits | Watch for READY and check the open positions in `titan2 status`; read `journalctl -u titan2-bot` and the kernel log for an out-of-memory kill (`journalctl -k`); if it repeats → [P1](#p1-bot-down-with-positions-open) |
-| `BOT_FATAL` | The bot refuses to start (exit 78: a module in the working directory that shadows an import while no structure is open, patched Kite, or a DB that fails migration or its integrity check); systemd does not restart it | [P1](#p1-bot-down-with-positions-open); a DB problem → [P10](#p10-db-corruption) |
+| `BOT_FATAL` | The bot refuses to start (exit 78: a module in the working directory that shadows an import while no structure is open, patched Kite, or a DB that fails migration or its integrity check); systemd does not restart it. Not delivered (no network): the next start sends it | [P1](#p1-bot-down-with-positions-open); a DB problem → [P10](#p10-db-corruption) |
 | `BROKER_SQUAREOFF` | The broker's MIS square-off closed a bot position (₹50 + GST); the bot was not flat by 15:25. At a start it can also be a paper leftover that the paper exchange closed on an earlier day while titan2 was down, booked now from the paper exchange's own record of that close | Find why in the report (no bids? stuck order? the bot down at 15:26?). No halt |
 | `CALENDAR` | The session calendar file is unusable, so titan2 treats every day as closed | Fix `titan2/data/nse_sessions.json` in git and deploy ([P15](#p15-calendar-hours-and-charges-updates)) |
 | `COMMANDS_RESET` | A command DB was replaced or its ids went backwards; that source's commands are ignored | Use the CLI or the Kite app; investigate the file, never edit it |
@@ -393,6 +403,7 @@ Every halt also sends `HALT_<KIND>` (CRITICAL for the dangerous kinds): see [§6
 | Code | Meaning | Do |
 |---|---|---|
 | `BAN_LIST` | The F&O ban list is unavailable: no stock is eligible today | Check the NSE file; a manual override goes in `/var/lib/titan2/config/ban_override/<date>.csv` |
+| `BOT_RESTARTED` | Laptop: titan2 crashed (exit 3) and its runner restarted it (the restarted bot sends this); recovery resumes the exits. After 5 restarts it stops: `BOT_GAVE_UP`. An INFO `BOT_RESTARTED` says titan2 is starting again after a controlled restart (exit 75, after `FEED_DEAD` or `TOKEN`) | Check the open positions; read the traceback in the laptop log and report it (the INFO one: nothing) |
 | `CHARGES_CHECK` | The LIVE virtual contract note was unavailable today. (For the PAPER sample the same failure is only an event, `CHARGES_CHECK` with `VCN_PAPER_UNSUPPORTED`: Kite refused the synthetic ids, so the rates were not checked) | Nothing; it retries tomorrow. The RateSet stays [V] until V1 and V5 ([§10](#10-v-verification-checklist-and-results)) |
 | `CHARGES_DRIFT` | Zerodha's contract note differs from titan2's charges by more than ₹1 per order | [P15](#p15-calendar-hours-and-charges-updates) |
 | `CLOCK_JUMP` | The wall clock jumped more than 2 s | Check time sync (`timedatectl`) |
@@ -410,17 +421,27 @@ Every halt also sends `HALT_<KIND>` (CRITICAL for the dangerous kinds): see [§6
 | `MARGIN_REJECT` | An order was rejected for margin or RMS | Check funds in Kite |
 | `NO_BID` | Exiting into an empty bid book for 10 s (CRITICAL from 15:20) | Watch; → [P7](#p7-not-flat-at-1522) |
 | `ORDER_REJECTED` | An order was rejected | Entry: a cooldown starts (3 per book → HALT REJECTS). Exit: retried by the ladder |
+| `POWER` | Laptop: it switched from AC to battery power (looked at every 30 s; at most one a 30-minute window). After it, one INFO `POWER` says when it is back on AC | Plug the charger in; on battery Windows may sleep or cut the Wi-Fi, and a sleeping laptop manages nothing |
 | `PUB_WRITE` | Writing a dashboard file failed; the dashboard may be stale | Check disk space and permissions |
-| `READ_LOST` | A broker read went unanswered for 15 s; asked again | Nothing unless repeated |
+| `READ_LOST` | A broker read went unanswered for 15 s; asked again. On the laptop the LIVE account's reads say "Kite account check (no LIVE trading here)": they only check the Kite account, no LIVE order leaves the laptop | Nothing unless repeated |
 | `RESERVE_REFUSED` | The DB refused to reserve a position slot | Report |
 | `SELFCHECK` | The prestart self-check did not run | Check the log; entries may stay halted |
 | `SELFTEST` | A LIVE self-test attempt failed: not CANCELLED unfilled within 5 s, or its tag did not come back in a WS order update and in `orders()` within 5 s more (retry at 09:17; two failures → LIVE_DISABLED_TODAY) | Check the Kite order history |
-| `STALE_RECON` | Broker reads are failing (3 in a row → HALT STALE_RECON) | Check Kite API status |
+| `SESSION_IMPAIRED` | G1 marked a session disturbed (IMPAIRED) for the strategies named, with why: a heartbeat gap (titan2 stopped or started late), an operator halt, a mode OFF, a diverted or refused-after-reserve entry. One message per event's new marks; a mark is never sent twice. Its trades still count, but a strategy whose IMPAIRED days pass 10% of the days it traded cannot pass G1 | Nothing now; avoid the cause (start before 09:15; no Ctrl+C before 15:15 with a position open: LAPTOP.md section 4) |
+| `STALE_RECON` | Broker reads are failing (3 in a row → HALT STALE_RECON). On the laptop the LIVE account's say "Kite account check (no LIVE trading here)" | Check Kite API status |
 | `TOKEN` | A new session token works: controlled restart (exit 75) | Nothing |
 | `TOKEN_LOGIN_NEEDED` | Manual token mode: a login is needed | [P5](#p5-token-failure) |
 
-**INFO** (no action): `POSITION_OPENED`, `POSITION_CLOSED`, `DAILY_REPORT`, `G1_REPORT`, `G1_CERTIFIED`, `SELFTEST`
-(passed), `ACK_ALERT`, `NO_SESSION` (a weekday without an NSE session: the bot only keeps the dead-man check fed).
+**INFO** (no action): `POSITION_OPENED`, `POSITION_CLOSED` (a placebo's begin "control trade (placebo), not a
+strategy result": G1's control, not a strategy's trade), `DAILY_REPORT` (books, halts, the day's refusals and voids
+by reason, the saved what-if totals, the paper condor, the bar check, the alerts delayed or not delivered, and each G1
+line's "today counts for G1: yes" or "no (why)"), `G1_REPORT`, `G1_CERTIFIED`, `SELFTEST` (passed), `ACK_ALERT`,
+`NO_SESSION` (a weekday without an NSE session: the bot only keeps the dead-man check fed), `START_CARD` (laptop:
+titan2 is up, once its self-check after prep is done; one a session, from the first run that gets that far: a later
+in-process restart sends `BOT_RESTARTED` instead; no card by 09:15 means it is not running), `BOT_RESTARTED`
+(laptop: titan2 is starting again after a controlled restart, exit 75; after a crash it is a WARN),
+`ALERTS_DELAYED` (the network, or the service after its rate limit, is back: the kept messages follow), `POWER`
+(laptop: back on AC power after a `POWER` WARN).
 
 ## 6. Halts
 
@@ -481,12 +502,16 @@ same rows run inside the bot at startup (prestart), where a failure adds an entr
 | `live_ready` | LIVE strategies hold CERTIFIED trials; margin ≥ ₹60,000 | LIVE_DISABLED_TODAY or demotion | Add funds, or run PAPER |
 | `rates` | charges confirmed within 180 days | WARN | [P15](#p15-calendar-hours-and-charges-updates) |
 | `prev_session` | the previous session ended flat with its EOD timeline done | CRITICAL | Check yesterday's report and Kite; ack what recovery raises |
-| `notify` | Telegram test message and healthchecks ping | WARN | Check `TELEGRAM_*` and `HEALTHCHECK_URL` in the env |
+| `notify` | Telegram test message and healthchecks ping (on the laptop: a message channel, ntfy or Telegram, and `HEALTHCHECK_URL` set; no test message, the start card proves delivery) | WARN | Check `TELEGRAM_*` or `NTFY_TOPIC`, and `HEALTHCHECK_URL`, in the env |
 
 On the Windows laptop, `titan2 laptop check` and the bot run the phase `laptop` instead, with its own rows and
 `SELFCHECK_<ROW>` alerts: `python`, `env_file`, `token`, `clock`, `network`, `calendar`, `instruments`, `disk`,
-`db`, `settings`, `power`, `live_disabled`. Their effects are in
-[TITAN_INSTRUCTIONS §14](../TITAN_INSTRUCTIONS.md#laptop-mode-windows-paper-only), the fixes in
+`db`, `settings`, `power`, `lid`, `restart_pending`, `update_hours`, `wifi`, `notify`, `live_disabled`. The four
+laptop-settings rows and `notify` only WARN, with no alert of their own (the bot's `START_CARD` lists them), and SKIP
+when the setting cannot be read: `lid` (closing the lid while plugged in does not "do nothing"), `restart_pending`
+(Windows Update waits for a restart), `update_hours` (its active hours leave part of 08:00-16:00 open to a restart),
+`wifi` (more than one saved network connects automatically).
+Their effects are in [TITAN_INSTRUCTIONS §14](../TITAN_INSTRUCTIONS.md#laptop-mode-windows-paper-only), the fixes in
 [LAPTOP.md §12](LAPTOP.md#12-if-something-goes-wrong).
 
 ## 8. Cutover stages

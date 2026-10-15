@@ -8,7 +8,8 @@
 - Tighten-only: a key's ceiling is its default (LIMITS). Loosening needs a code change. The keys that only calibrate
   the paper exchange are fixed at their defaults (lo == hi): a file can set them to nothing else.
 - set_setting() (`titan2 settings set KEY VALUE`) validates the whole resulting file and replaces it atomically.
-  No UI writes settings.
+  No UI writes settings. A file that is already invalid is repaired one change at a time: a set or unset that
+  removes some of its problems and adds none is written, and the file stays invalid until the last one.
 - Versioned keys feed every strategy version via Settings.versioned_view(); changing one starts a new G1 trial.
 
 Late facts (verified 2026-10-10): NSE F&O trades 09:15-15:40 since 2026-08-03, but Zerodha's MIS auto square-off
@@ -554,6 +555,9 @@ class SetResult:
     before: Settings
     after: Settings
     path: Path
+    # a repair of an invalid file that leaves it invalid: the problems still in it. Then new is the key's value once
+    #   the file is valid, after is the code defaults (what the bot runs on until then) and versioned is False.
+    still_invalid: tuple[str, ...] = ()
 
     def message(self) -> str:
         if not self.changed:
@@ -562,6 +566,9 @@ class SetResult:
                 f"takes effect at next restart")
         if self.versioned:
             text += "; versioned key: every strategy gets a new version (a new G1 trial)"
+        if self.still_invalid:
+            text += ("; the file is still invalid, so the bot keeps running on the code defaults (HALT "
+                     f"SETTINGS_INVALID) until these are fixed or unset too: {'; '.join(self.still_invalid)}")
         return text
 
 
@@ -583,7 +590,8 @@ def set_setting(key: str, value: Any, path: str | Path | None = None) -> SetResu
     """Validate KEY=VALUE together with the rest of the file, then replace the file atomically.
 
     value is CLI text or a Python value. Raises SettingsError, leaving the file untouched, when the key is unknown,
-    the value is malformed or looser than its bound, or the rest of the file is invalid.
+    the value is malformed or looser than its bound, or the rest of the file is invalid (unless the change repairs
+    one of its problems and adds none: _update).
     """
     lim = LIMITS.get(key)
     if lim is None:
@@ -601,6 +609,26 @@ def unset_setting(key: str, path: str | Path | None = None) -> SetResult:
     return _update(Path(path) if path is not None else default_path(), key, _UNSET)
 
 
+def _problems(data: Mapping[str, Any]) -> set[str]:
+    """Every problem of a settings object: each key's own (unknown, wrong type, beyond its bounds), then the rules
+    between keys with those keys left out. from_mapping() stops at the first kind, so a repair could otherwise hide a
+    new cross-key problem behind an old one."""
+    own: dict[str, str] = {}
+    for k, raw in data.items():
+        lim = LIMITS.get(k)
+        if lim is None:
+            own[k] = _unknown(k)
+            continue
+        try:
+            problem = lim.problem(k, _coerce(k, lim, raw))
+        except _Bad as exc:
+            problem = str(exc)
+        if problem is not None:
+            own[k] = problem
+    _, rest = from_mapping({k: v for k, v in data.items() if k not in own})
+    return set(own.values()) | set(rest)
+
+
 def _update(p: Path, key: str, new: Any) -> SetResult:
     _, _, data, errors = _read_document(p)
     if errors:
@@ -612,8 +640,25 @@ def _update(p: Path, key: str, new: Any) -> SetResult:
     if new is not _UNSET:
         doc[key] = new
     after, errors = from_mapping(doc)
+    lim = LIMITS.get(key)
     if after is None:
-        raise SettingsError(errors)
+        # A file that is already invalid is repaired one change at a time: one that removes some of its problems and
+        #   adds none is written though others remain. A file holding several paper keys the code has since fixed
+        #   (paper model 2) could otherwise be repaired by neither `unset` nor `set KEY <default>` (review round 4):
+        #   removing one key left the other's error, so nothing was written. Any other change waits for a valid file.
+        left = _problems(doc)
+        if parsed is not None or not left < _problems(data):
+            raise SettingsError(errors + ([] if parsed is not None else [
+                f"{p} is already invalid: a change is written only when it removes one of its problems and adds "
+                "none (`titan2 settings unset KEY` removes a key)"]))
+        try:
+            _atomic_write_json(p, doc)
+        except OSError as exc:
+            raise SettingsError([f"cannot write {p}: {exc}"]) from exc
+        return SetResult(key=key, old=before.to_json()[key] if lim else data.get(key),
+                         new=(new if new is not _UNSET else _to_json(lim, lim.default)) if lim else None,
+                         changed=True, versioned=False, before=before, after=DEFAULTS, path=p,
+                         still_invalid=tuple(errors) + tuple(sorted(left - set(errors))))
     doc = {k: _to_json(LIMITS[k], getattr(after, k)) for k in doc}     # one normalized form on disk
     # an invalid file always changes; a valid one only when a value does (not for formatting such as "09:30")
     changed = parsed is None or doc != {k: _to_json(LIMITS[k], getattr(parsed, k)) for k in data}
@@ -622,11 +667,13 @@ def _update(p: Path, key: str, new: Any) -> SetResult:
             _atomic_write_json(p, doc)
         except OSError as exc:
             raise SettingsError([f"cannot write {p}: {exc}"]) from exc
-    lim = LIMITS.get(key)
+    # a versioned key gives new versions only when what the bot runs on changes: the last repair of an invalid file
+    #   that leaves the defaults in force (the bot ran on them meanwhile) starts no new G1 trial
     return SetResult(key=key,
                      old=before.to_json()[key] if lim else data.get(key),
                      new=after.to_json()[key] if lim else None,
-                     changed=changed, versioned=bool(lim and lim.versioned), before=before, after=after, path=p)
+                     changed=changed, versioned=bool(lim and lim.versioned)
+                     and before.versioned_view() != after.versioned_view(), before=before, after=after, path=p)
 
 
 # Ported from agentic_trader/settings_manager.py:131-145 @b4694f3 — changes: temp file in the same directory, fsync,

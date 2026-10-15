@@ -13,6 +13,227 @@ win more often with cost-aware exits judged on the bid, and keep every strategy 
 The honest expected outcome is that no strategy reaches LIVE. Full description: [TITAN_INSTRUCTIONS.md](TITAN_INSTRUCTIONS.md).
 Entries below this one describe v1.
 
+### Reliability and visibility (2026-10-14 night)
+No strategy, setting or version change: the strategies keep their versions (`opening_drive` 1.b230b83102,
+`price_spike_up` 1.3a030f3e26, `price_spike_down` 1.9f039e44a7), and no strategy's decision sees anything new. From
+the self-audit of the first three laptop sessions.
+- **Kite's quote connection is kept warm.** A quote made after 5 or more quiet minutes took a median 0.98 s (16 of 33
+  over 1 s, the 09:20 batch 2.0 s late), against 0.11 s on a warm connection: Kite, or a router on the way, closes an
+  idle connection and the next quote waits for a new one. From 09:00 to 15:30 on a trading day the quote thread now
+  makes one small request (the last price of NIFTY 50) whenever no quote went out for 60 s, through the same
+  one-a-second limit as every quote (about 1% of it). Its answer is thrown away: no entry or exit decision sees it.
+  Only a failure is logged. It never goes out within 3 s of a whole minute: a 60 s rhythm started at 09:00:00 would
+  otherwise take the limit's token at 09:20:00, from opening_drive's batch, and at every bar close
+  (`titan2/broker/lanes.py`, `ReadsLane.keep_warm`; the hours are `runtime.quotes_keep_warm`).
+- **A DNS blip no longer breaks Kite calls.** On 10-14 from 14:22:08 to 14:22:53 every new connection failed with
+  "getaddrinfo failed" (13 account reads lost, a STALE_RECON halt, 3 lost phone alerts) while the WebSocket stayed
+  up. titan2 now remembers each server's last good IPv4 address and connects to it when the name lookup fails; the
+  TLS certificate is still checked against the real name, so a wrong address fails instead of reaching another
+  server (`titan2/net.py`, `remember_ipv4`, installed with the IPv4-only setting).
+- **Phone alerts are no longer thrown away in a network drop.** A message that still fails after its tries because
+  of the network (a timeout, no DNS, no connection, or HTTP 429/5xx) is kept, up to 200 messages for up to 2 hours,
+  and the messages after it wait behind it. Every 30 s one line is tried; when it goes through ("network back at
+  14:23:37 after 67 s; 3 alerts delayed") the kept messages follow, a CRITICAL first, each with the time it was
+  raised. A CRITICAL's 5-minute repeats pause meanwhile, so no burst arrives afterwards. A message the service
+  refuses (another HTTP 4xx) is logged and dropped, as before, and is no longer tried three times. What is still
+  undelivered when titan2 stops is written to `var/run/alerts_outbox.json` and sent at the next start
+  (`titan2/alerts.py`); so is a fatal start's `BOT_FATAL` (exit 78) that could not go out.
+- **The phone says when titan2 is alive.** On a quiet day the phone stayed silent, which looked exactly like a dead
+  laptop. Now, once the bot's own laptop self-check after the morning preparation is done (its signals start
+  then), it sends one INFO `START_CARD`: PAPER only, every FAIL and WARN self-check row, the clock, network and power
+  (AC or battery) rows, each strategy's mode and version, and the paper condor. No card by 09:15 means titan2 is not
+  running. A crash restart reaches the phone as a WARN `BOT_RESTARTED` (sent by the restarted bot), and the stop
+  after the fifth restart ("open positions are NOT managed now") as a CRITICAL `BOT_GAVE_UP`, which also pings the
+  dead-man's `/fail` and is kept for the next start if the network is down; both were console lines only.
+- **A `notify` row in the laptop self-check.** It checks that a phone channel (ntfy or Telegram) is set up and that
+  `HEALTHCHECK_URL` is (without it there is no external dead-man: nothing rings when the laptop stops), WARN only and
+  with no alert of its own (the start card lists it). It sends no test message: the start card proves delivery
+  every morning. The env-file row no longer says alerts need Telegram when ntfy carries them, and the hint printed
+  when there is no env file names `NTFY_TOPIC` and `HEALTHCHECK_URL`. `HEALTHCHECK_URL` is in
+  `ops/windows/titan2.env.example`, `ops/windows/setup.ps1`'s list and docs/LAPTOP.md section 2, with the check's
+  schedule.
+- **A crossed quote can no longer hide the paper condor's 3x stop.** The 15:25 check values each leg at its mid, and
+  a leg whose bid is above its ask (a crossed book) has none, so it fell to the "no bid" rule, half its ask: in the
+  audit's probe a short put crossed by one tick turned a 3.70x stop into a 1.40x hold. Now, on a stop day, a crossed
+  or locked leg (bid at or above the ask) fails that try and the job tries again 45 s later, as after a failed Kite
+  call. At the last try (the third, one too late in the window for another, or a `titan2 condor tick` by hand) a
+  short is valued at the higher of its bid and ask and a wing at the lower; a stop then buys a short back at no
+  less than its best bid and sells a wing at no more than its best ask (the paper exchange's rule at its 15:26
+  square-off), and a note says so (`titan2/condor.py`: `mark`, `leg_mark`, `worse_side`).
+- **A missed condor check now leaves a trace.** When titan2 is not running at 15:25 (laptop off, stopped early,
+  started late), that day's 3x stop check or entry is skipped and nothing makes it up, and until now nothing recorded
+  it either. Each start now writes a MISSED note, once, for every trading day since the condor's first 15:25 tick
+  with no completed tick while a condor was open (its stop check) or due (the entry day of an expiry the instruments
+  listed at an earlier tick). `titan2 condor status` lists the latest three and the console prints each one as it is
+  written (`missed_duties`, `record_missed`). How a missed check should be made up is still the owner's decision.
+- **No 75-second blind spot after a restart.** A restart reuses the previous session's 5-minute bars stored in
+  titan2.db only when they are complete, and complete meant a bar within 10 minutes of the 15:40 close. Since
+  2026-08-03 F&O stocks close by auction and their last bar is the 15:10 one, so the test never passed: all 7 starts
+  fetched 213 of 213 stocks again, about 75 s before signals start, the 10-13 restarts at 11:45 and 13:08 included.
+  Stored bars are now complete when they reach the latest bar stored for that session; a stock whose bars stop
+  earlier is still fetched. The bars are the same, so no decision changes (`titan2/runtime.py`, `_complete`).
+- **The paper square-off no longer sells a long at ₹0.05 when its only book came early in its wait.** Paper model 2
+  says that when the only book the 15:26 square-off gets in its 1.5 s wait is crossed or locked, it fills on that
+  book at its worse side, never at the no-book ₹0.05. That held only while the book was under 1 s old at the end of
+  the wait. On a thin option's silent feed the only book is the REST answer the wait asks for, about 0.2 s in, so at
+  the end it was 1.3 s old and counted as none (review round 4's probe sold 100 at ₹0.05). Any book received since
+  the wait began now counts at its end; one from before the wait never does. This is what paper model 2 already
+  described, so no version changes (`titan2/broker/paper.py`, `_maybe_squareoff`).
+- **A settings file with several now-fixed paper keys can be repaired.** The remedy for a file that sets one of the
+  paper keys fixed by paper model 2 is `titan2 settings unset KEY`. With two such keys neither `unset` nor
+  `set KEY <default>` could write: each checked the whole resulting file, and removing one key left the other's error.
+  A file that is already invalid is now repaired one change at a time: a change that removes some of its problems
+  and adds none is written, and the message lists what is still wrong. Any other change still waits for a valid
+  file. The bot stays on the code defaults (HALT SETTINGS_INVALID) until the file is valid and it restarts
+  (`titan2/settings.py`, `_update`). A change no longer says "every strategy gets a new version" when what the bot
+  runs on stays the same, as after the last repair of a file that leaves only defaults.
+- **Every Kite quote call is measured.** The self-audit had to rebuild every latency by hand from receipt stamps.
+  Each call of the quote client now records how long it took (what the entry or exit waited, and Kite's own share
+  without titan2's one-a-second pacing), how many symbols it asked, the seconds since the previous call (60 s or
+  more: a cold connection), whether a dropped connection was asked again, and the outcome; one `quote call:` line
+  each goes to the log file (not to the laptop's console). Once a minute, with the heartbeat, the engine writes them
+  into one DEBUG `LATENCY` event, and the daily report's latency table has `quote_call_ms` and `quote_kite_ms` rows
+  (n, p50, p95 and a new max column) and a line with the cold share, failures, retries and keep-warm calls
+  (`titan2/broker/lanes.py`, `QuoteCall`, `take_quote_calls`; `titan2/broker/kite.py`, `KiteData.last_quote`).
+- **Every broker read's round trip is measured.** The exit's wait for a positions read (decision B1) failed Stage 2
+  on paper's guessed delay, and nothing recorded what Kite's real reads take. The engine now keeps each positions,
+  orders and margins read's round trip, from its send to its answer, per account and kind, in the same `LATENCY`
+  event, and the latency table has a `read_ms:<ACCOUNT>:<KIND>` row for each (the LIVE rows are Kite's real numbers,
+  the PAPER ones the paper exchange's seeded delay) and a line counting failed reads (`titan2/core/engine.py`,
+  `_note_read`, `_flush_latency`; `titan2/ledger.py`).
+- **A paper fill's log line names the book it filled on.** Paper kept no record of it, so paper and LIVE could not be
+  compared after the fact. The COMPLETE (or IOC CANCELLED) line now says WS or REST, the book's receipt and exchange
+  times, how old it was at the order's due time (or how long after it it came), how long past due the fill came, the
+  walked side's levels down to the limit and the order's draw. The log line only: no fill and no table changes
+  (`titan2/broker/paper.py`, `_book_note`).
+- **The bar check keeps the signed volumes and the pre-open volume.** On 10-14 none of 23 opening bars matched Kite's
+  volume within 0.1% (10 were more than 5% off) while their open and close, and later bars, matched: most likely
+  Kite's 09:15 candle leaves out the pre-open auction, which titan2's first bar includes. The 15:36 check now stores
+  in `bar_checks.detail` both volumes as they are, the signed gap (`volume_gap`, `volume_rel`), the pre-open volume
+  (the cumulative volume at the stock's last tick before 09:15:00: the bar builder sends it with the first bars and
+  the engine keeps it as a DEBUG `PREOPEN_VOLUME` event) and `volume_rel_ex_preopen`, so tomorrow's check shows the
+  cause. Nothing judges on them: the check, G1 and `opening_drive`'s 3x volume filter are unchanged, and making the
+  two volumes match would be a new version (the owner's decision). The "[V]" notes in `titan2/market/bars.py` and
+  `titan2/strategies/opening_drive.py` now say the check failed them (docstrings only: no version moved).
+- **Laptop settings that can end a session are checked.** On 10-14 the lid was set to Sleep when plugged in, a
+  Windows restart was pending, Windows Update's active hours began at 09:00 (it had restarted this laptop at 06:08,
+  06:55 and 07:34 on earlier days) and 8 of 9 saved Wi-Fi networks connected by themselves (a switch dropped the feed
+  on 10-13), while the self-check said 12/12 PASS. Four new laptop rows, `lid`, `restart_pending`, `update_hours` and
+  `wifi`, read them as a standard user (powercfg, the registry, netsh, never a Wi-Fi key) and WARN with what to
+  change. They block nothing, send no message of their own (the start card lists them) and SKIP when a setting
+  cannot be read (`titan2/selfcheck.py`; the probes in `titan2/laptop.py`).
+- **A switch to battery reaches the phone.** It was a log line every 15 minutes. The power source is now looked at
+  every 30 s: AC to battery is one WARN `POWER`, and back on AC after it one INFO. The alerter's 30-minute WARN dedup
+  keeps a loose plug from ringing again and again, and starting on battery sends nothing (the start card says so)
+  (`titan2/laptop.py`, `Supervisor._watch_power`).
+- **Placebo alerts say what they are.** On 10-14 the phone showed "PLACEBO:price_spike_up ... net Rs -5,299.97" like
+  any trade. A placebo's opened and closed alerts now begin "control trade (placebo), not a strategy result", and the
+  daily report's phone text labels placebo books the same way (`titan2/core/positions.py`).
+- **The 15:38 phone report says more.** Besides the books, the halts and the G1 lines it now gives the day's
+  refusals and voids by reason, the what-if totals saved so far (today's what-if needs Kite's minute bars and runs
+  after the session, so the line says it is not in yet), the paper condor (laptop), the bar check with its reasons,
+  the alerts delayed or not delivered this run, and on each G1 line "today counts for G1: yes" or "no (why)": a mode
+  G1 does not test, no running trial, a PAPER mismatch today, or an IMPAIRED mark. The markdown report has the same
+  lines and a `today` column in its G1 table; display only (`titan2/ledger.py`).
+- **A day G1 marks as disturbed reaches the phone.** SESSION_IMPAIRED was an event only, so 10-13's marks after its
+  10:03 start never reached the phone. Each event's new marks are now one WARN `SESSION_IMPAIRED`, naming the
+  sessions, the strategies and why; a mark is never sent twice (`titan2/core/engine.py`, `_impaired_alert`).
+- **The laptop's Kite account warnings no longer read like real-money trouble.** No LIVE order leaves the laptop,
+  yet "LIVE: 1 POSITIONS read(s) unanswered" looked like a live-trading problem. There the LIVE account's `READ_LOST`
+  and `STALE_RECON` warnings now begin "Kite account check (no LIVE trading here)"; the events, and the server's
+  wording, are unchanged.
+- **The dashboard's events tail keeps the morning.** At the 10-14 close 227 of the last 500 events were heartbeats
+  and the oldest left was from 11:53, so the 09:20 batch and the morning's refusals had dropped out. The tail now
+  leaves out the DEBUG rows (the heartbeats and the new measurement events), which stay in titan2.db and the exports
+  (`titan2/ledger.py`, `publish_events_tail`).
+- Not done in this batch: the 09:21 message with `opening_drive`'s batch (`opening_drive` is moving to SHADOW).
+- Tests: the new `tests/unit/test_reliability_visibility.py`; the laptop self-check table and its healthy laptop
+  (`test_selfcheck_laptop.py`: 17 rows, `notify` without an alert, a healthy laptop has a dead-man URL); the start
+  card through the real bot in `test_laptop.py`'s in-process session; the Windows env keys in
+  `tests/ops/test_windows_scripts.py`; the condor's crossed legs, its last try and the MISSED notes in
+  `test_condor.py`; the restart's stored bars in `test_runtime_cli.py`; the square-off on a silent feed in
+  `test_paper.py`; the settings repair in `test_settings.py`; the measurements, the laptop-settings rows and the
+  power watch, and the phone and dashboard changes in the new `tests/unit/test_measurement_and_housekeeping.py`, with
+  the four new rows in `test_selfcheck_laptop.py` and the in-process session's offline probes in `test_laptop.py`.
+  Docs: the RUNBOOK's alert codes (`BOT_RESTARTED`, `BOT_GAVE_UP`, `START_CARD`, `ALERTS_DELAYED`, the kept
+  messages, `POWER`, `SESSION_IMPAIRED`, the laptop's wording of `READ_LOST` and `STALE_RECON`, what `DAILY_REPORT`
+  gives), the laptop's `notify` row and its four settings rows, and P13's repair of an invalid settings file;
+  LAPTOP.md sections 2, 3, 5, 8, 10 and 12; TITAN_INSTRUCTIONS §4, §5, §8, §12 and §14; one errata line in the spec.
+- Follow-ups, from the review of this batch (2026-10-15; still no strategy, setting or version change):
+  - **The phone hears of a missed condor check and of a condor stop.** The condor line of the start card and of the
+    15:38 report kept only the open condor and the test, so an open condor whose 15:25 stop check was missed showed
+    its old mark and nothing else, and a condor stopped at 3.70x showed only as "test: running". The line now also
+    has the closed condors with the last close and its reason, and the latest MISSED note, shortened, with how many
+    there are (`laptop.condor_brief`).
+  - **A late condor try knows it is the last.** A try counts as the last when no other can start before 15:29:30,
+    and that now allows for the supervisor's passes 0.2 s apart, with 2 s to spare: a try at 15:28:44.95 waited for
+    a retry that the next pass, at 15:29:30.05, could no longer start. A try also asks again at its end: one that
+    found a crossed leg at 15:28:40 and then waited past the window for a slow Kite day-bar call ended with the stop
+    unchecked, and the condor was held to settlement. It now makes the check itself before it ends, the leg at its
+    worse side (`condor.CondorJob.retry_fits`, `Ctx.can_retry`, `tick`).
+  - **No false MISSED note when only the entry step failed.** A day whose stop check was made (its mark is stored)
+    while the entry step failed on all three tries (Kite's instruments call, with no list saved that morning) got
+    "skipped the 3x stop check" at the next start. Such a day is no missed check now (`condor.missed_duties` reads
+    the marks).
+  - **A message on its way out at a stop is kept.** stop() waits about 6 s for the alerts thread, then saved only
+    the kept and the queued messages, so the one being sent (most likely `BOT_CRASHED`, sent right before the stop,
+    into a connect that hangs) was in neither and was lost. It is saved too when its try still hangs at the stop's
+    deadline; the thread makes no further try of it then and drops its late result (`alerts.Alerter._inflight`).
+  - **One start card a session.** Each in-process restart sent its own `START_CARD`: a loop of 6 crashes put 6 cards
+    on the phone besides the crash alerts. One run a session sends it now, the first that gets as far as its
+    self-check result; the phone hears of a restart as `BOT_RESTARTED` (`runtime.BotProcess(start_card=...)` and
+    its `card_sent`, which `laptop._bot_loop` uses).
+  - **A rate limit is no network outage.** HTTP 429 counted as one: sending a backlog of 120 kept alerts into
+    ntfy.sh's limit (60 at once, then one every 5 s) started a new outage at each 429, each with one more
+    `ALERTS_DELAYED` line (9 in all, "network back ... after 30 s", though the network never dropped). A 429 while
+    the backlog goes out now only makes it wait 10 s and go on (one line in all), and a hold that began with one
+    says "rate limit (HTTP 429) over at ..." (`AlertError.rate_limited`). A CRITICAL's repeats pause until the kept
+    messages are all out.
+  - **The delayed-alerts line counts a start that is still offline.** A start that took the previous run's
+    undelivered alerts while the network was still down never noted when the outage began, so after 3 minutes the
+    line said only "2 alerts from the previous run ... were not delivered" and then 5 came. The first failed try of
+    the line now marks it: "network back at ... after 180 s; 5 alerts delayed (2 of them from the previous run,
+    saved ...)".
+  - **A dead-man schedule that fits the laptop.** The laptop's docs gave the server's schedule, whose first tick is
+    08:45: it rang the phone for every start after about 08:46 (and again when titan2 came up), and for every early
+    stop. The laptop's own begins at 09:15 (`15-59 9 * * 1-5`, `* 10-14 * * 1-5` and `0-33 15 * * 1-5`, 3 minutes
+    grace: `alerts.LAPTOP_DEADMAN_SCHEDULE`), so a start by 09:10 is in time, and docs/LAPTOP.md and the Windows env
+    example say to pause the check when stopping before 15:33, after titan2 has stopped: within a minute of the
+    window's `titan2 stopped cleanly` (its next ping resumes it). Change an existing laptop check to this schedule.
+  - Tests: new cases in `test_condor.py` (the late and the slow try, a mark made by a try whose entry step failed),
+    `test_reliability_visibility.py` (the condor line, one start card a session, the message in flight at the stop,
+    the rate limit, a start still offline), `test_alerts_token_selfcheck.py` (a laptop day on the laptop's schedule)
+    and `test_docs.py` (the laptop's dead-man docs); `test_reliability_visibility.py`'s first condor line test now
+    expects the closed line too. Docs: LAPTOP.md sections 2, 4 and 8, the RUNBOOK's alerts and `START_CARD`,
+    TITAN_INSTRUCTIONS §14.
+  - From the review of these follow-ups (the same day; four fixes, still no strategy, setting or version change):
+    - **The start card when the first run ends early.** Only a session's first run was told to send the card, also
+      when that run ended before its self-check result (a crash in prep, or a controlled restart): the session then
+      had no card at all, so "no card by 09:15" read as titan2 not running, and the card's FAIL and WARN rows never
+      reached the phone. The first run that reaches its self-check result sends it now, once; a result that comes
+      after its run's alerter began to stop sends nothing, and the next run sends the card. A controlled restart
+      (exit 75) now reaches the phone too, as an INFO `BOT_RESTARTED`: with no second card, the phone's last word was
+      the `FEED_DEAD` or `TOKEN` alert that announced the restart (`laptop._bot_loop`, `BotProcess.card_sent`).
+    - **A quick retry still goes out during a stop.** The in-flight fix also ended a message's tries as soon as
+      stop() was called: a `POSITION_CLOSED` raised seconds before a clean stop, whose first try met a connection
+      reset, waited for the next start (on the laptop the next morning) though the stop's 5 s had room for the
+      retry. The message keeps its tries until the stop's deadline; only a try still hanging then is cut and kept
+      (`Alerter._past_stop_deadline`).
+    - **No burst of repeats after a rate limit.** Once a 429 while the kept messages go out only made them wait, a
+      CRITICAL's 5-minute repeats came back then: each got 429 and was kept as one more CRITICAL, so after an hour
+      of 429 the 12 repeats raised in it reached the phone within 12 s, and a stop during it saved them all for the
+      next start. The repeats now pause until the kept messages are all out (`Alerter._due_repeats`).
+    - **Pause the dead-man after an early stop, not before.** The docs said to pause the check before stopping
+      before 15:33, but titan2 pings while it stops (through the Ctrl+C flatten, and once more as it exits), and a
+      ping resumes a paused check, which then rang 3 to 4 minutes after the exit. They now say to pause it after
+      titan2 has stopped, within a minute of the window's `titan2 stopped cleanly` (with the check's page opened
+      before the Ctrl+C).
+    - Tests: `test_reliability_visibility.py` (the card after a first run that ended early, a card whose run had
+      ended, the retry during a stop, the repeats during a rate limit), `test_alerts_token_selfcheck.py` (the
+      laptop's day plays an early stop with the pause that docs/LAPTOP.md gives, read from it) and `test_docs.py`
+      (the new advice, and the old one gone). Docs: LAPTOP.md sections 2, 3 and 4, the Windows env example, the
+      RUNBOOK's alerts, `BOT_RESTARTED` and `START_CARD`, TITAN_INSTRUCTIONS §14.
+
 ### Review round 2 fixes (2026-10-14)
 No paper fill, strategy or setting changes. The fixes that change how the engine trades, books or counts for G1 are
 covered by this release's `ENGINE_SEMANTICS_VERSION` 2 (listed under "Signals wait for unfinished orders" below).

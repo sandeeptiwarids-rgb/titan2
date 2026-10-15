@@ -1525,6 +1525,59 @@ def test_prep_prev_bars_cached_in_db(tmp_path):
     assert state.ban_symbols() == frozenset()
 
 
+class AuctionHistData(HistData):
+    """Kite's 5-minute stock bars since 2026-08-03 (F&O stocks close by auction): the last one starts at 15:10."""
+
+    def historical(self, symbol: str, token: int, frm: datetime, to: datetime, interval: str) -> tuple:
+        return tuple(b for b in super().historical(symbol, token, frm, to, interval)
+                     if b.start <= ist_datetime(b.start.date(), "15:10"))
+
+
+def test_prep_prev_bars_reuses_auction_era_stock_bars_after_a_restart(tmp_path):
+    """Self-audit F5: stored bars counted as complete only with a bar within 10 minutes of the 15:40 F&O close, which
+    stock bars never have since the closing auction (their last is 15:10), so every start fetched every stock again:
+    213 of 213 on all 7 starts, the 10-13 restarts at 11:45 and 13:08 among them, about 75 s before signals start.
+    Stored bars are now complete when they reach the latest HIST bar stored for that session; a stock whose bars stop
+    earlier is fetched again. The same bars either way."""
+    state = runtime.PrepState(S, DEFAULTS)
+    state.set_instruments(_instruments())
+    posted: list = []
+    given: dict = {}
+
+    def start(data: HistData) -> tuple[bool, str]:
+        prepper = runtime.Prepper(state=state, data=data, var_dir=tmp_path, calendar=CAL, settings=DEFAULTS,
+                                  post=posted.append, on_prev_bars=lambda s, b: given.__setitem__(s, b))
+        return prepper.prev_bars()
+
+    def persist(keep) -> None:                                      # the core persists the BarsClosed events
+        with store_mod.core_thread():
+            st = Store(tmp_path / "db" / "titan2.db", backup_dir=tmp_path / "backups")
+            with st.tx():
+                for ev in posted:
+                    for b in ev.bars:
+                        if keep(b):
+                            st.put_bar(b)
+            st.close()
+        posted.clear()
+
+    first = AuctionHistData(fail=set())
+    ok, detail = start(first)
+    assert ok and "2/2 stocks" in detail and "2 fetched, 0 failed" in detail
+    assert sorted(first.calls) == ["NSE:INFY", "NSE:RELIANCE"]
+    full = given["NSE:RELIANCE"]
+    assert len(full) == 72 and full[-1].start == ist_datetime(FRI, "15:10")                  # 09:15-15:10
+    persist(lambda b: b.symbol == "NSE:RELIANCE" or b.start < ist_datetime(FRI, "14:00"))  # INFY's stops at 13:55
+    again = AuctionHistData(fail=set())
+    ok, detail = start(again)
+    assert again.calls == ["NSE:INFY"] and ok and "1 fetched, 0 failed" in detail          # RELIANCE from titan2.db
+    assert given["NSE:RELIANCE"] == full and len(given["NSE:INFY"]) == 72
+    persist(lambda b: True)
+    third = AuctionHistData(fail=set())
+    ok, detail = start(third)
+    assert third.calls == [] and ok and "2/2 stocks" in detail and "0 fetched, 0 failed" in detail
+    assert given["NSE:RELIANCE"] == full and given["NSE:INFY"][-1].start == ist_datetime(FRI, "15:10")
+
+
 # ---------------------------------------------------------------------------------------------------------------
 # plugins
 # ---------------------------------------------------------------------------------------------------------------

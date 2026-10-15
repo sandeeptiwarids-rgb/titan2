@@ -80,6 +80,9 @@ class IntentReceived(Event):
 @dataclass(frozen=True, slots=True)
 class BarsClosed(Event):
     bars: tuple[Bar, ...]
+    # the session's first bars' pre-open volume, (symbol, the cumulative volume at its last tick before the session
+    #   opened), for the 15:36 bar check's detail (information only, 2026-10-14 night); empty for every other batch
+    preopen: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

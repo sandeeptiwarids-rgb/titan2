@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import threading
 from datetime import date, datetime, timedelta
 
 import pytest
@@ -506,3 +507,335 @@ def test_cli_status_tick_window_and_the_laptop_lock(tmp_path):
     odd = tmp_path / "a#b%c"                                  # the read-only URI copes with # and %
     condor.connect(odd).close()
     assert condor.cli("status", odd, {}, out.append) == 0 and "test: running (0 of 52 weeks entered)" in out[-1]
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Self-audit F4 (2026-10-14 night): a crossed quote never hides the 3x stop; a missed 15:25 leaves a trace
+# ---------------------------------------------------------------------------------------------------------------
+def _notes(var, kind: str) -> list[str]:
+    con = condor.connect(var)
+    try:
+        return [r["detail"] for r in con.execute("SELECT detail FROM notes WHERE kind = ? ORDER BY id", (kind,))]
+    finally:
+        con.close()
+
+
+def test_a_crossed_or_locked_leg_is_marked_and_filled_at_its_worse_side():
+    """leg_mark had no mid for a crossed book (bid above the ask), so a crossed short fell to "no bid: half its ask".
+    Now a short is marked at the higher of bid and ask and a wing at the lower, and a stop at the last try fills on
+    worse_side(): a short bought back at no less than its best bid, a wing sold at no more than its best ask."""
+    crossed = Q(106.50, 106.45, None, ((106.50, 500), (106.40, 500)), ((106.45, 500), (106.60, 500)), 0.0)
+    assert crossed.crossed and not crossed.two_sided
+    assert condor.leg_mark(crossed, True) == 106.50 and condor.leg_mark(crossed, False) == 106.45
+    w = condor.worse_side(crossed)
+    assert (w.bid, w.ask, w.bids[0], w.asks[0]) == (106.45, 106.50, (106.45, 500), (106.50, 500))
+    assert w.spread == pytest.approx(0.05) and w.asks[1] == (106.60, 500) and w.bids[1] == (106.40, 500)
+    assert condor.fill_prices(w, False, 65, 0.05) == {"real": 106.50, "x2": 106.55, "thin": False}   # a buy-back
+    assert condor.fill_prices(w, True, 65, 0.05) == {"real": 106.45, "x2": 106.40, "thin": False}    # a wing's sale
+    locked = Q(12.0, 12.0, None, ((12.0, 750),), ((12.0, 750),), 0.0)
+    assert locked.crossed and condor.leg_mark(locked, True) == condor.leg_mark(locked, False) == 12.0
+    assert condor.fill_prices(condor.worse_side(locked), False, 65, 0.05) == {"real": 12.0, "x2": 12.0, "thin": False}
+    assert not Q(9.9, 10.1, None, (), (), 0.0).crossed and not Q(None, 0.10, None, (), (), 0.0).crossed
+
+
+@pytest.mark.parametrize("ask_ticks", [-1, 0], ids=["crossed", "locked"])
+def test_a_crossed_short_fails_the_try_then_never_hides_the_3x_stop(week, ask_ticks):
+    """Self-audit F4 (probe probe_missed_and_crossed P3): Friday, NIFTY at 22,050, past the stop (3.21x the credit).
+    With the short put's book crossed by one tick, its mark fell to half its ask and the condor was marked 1.61x and
+    HELD: a crossed quote hid the stop. A crossed or locked leg now fails the try while the job can try again (no
+    mark, not recorded, a MARK note); at the last try (a tick by hand is one) it is marked at its worse side and the
+    stop fires, the short bought back at no less than its best bid."""
+    kite, rows, ctx, var = week
+    kite.book = priced(rows, at(WED))
+    assert condor.tick(ctx(WED)) == "ENTERED"
+    kite.book = priced(rows, at(FRI), F=22050.0, td=1)
+    depth = kite.book["NFO:NIFTY26OCT22000PE"]["depth"]
+    best_bid = depth["sell"][0]["price"]                                  # 50.00: the normal ask, now the bid
+    depth["buy"][0]["price"], depth["sell"][0]["price"] = best_bid, round(best_bid + 0.05 * ask_ticks, 2)
+    first = ctx(FRI)
+    first.last_try = False                                                # the job's first or second try
+    assert condor.tick(first) == "MARK_FAILED,NOT_ENTRY_DAY"
+    (row,) = _all(var)
+    assert row["state"] == "OPEN"
+    con = condor.connect(var)
+    try:
+        assert con.execute("SELECT COUNT(*) FROM marks").fetchone()[0] == 0          # nothing marked
+        assert con.execute("SELECT COUNT(*) FROM ticks WHERE day = ?", (FRI.isoformat(),)).fetchone()[0] == 0
+    finally:
+        con.close()
+    (retry,) = _notes(var, "MARK")
+    assert retry.startswith(f"2026-10-19: a crossed or locked book (NFO:NIFTY26OCT22000PE bid {best_bid:.2f} ask ")
+    assert retry.endswith("the stop check is tried again in 45 s")
+    assert condor.tick(ctx(FRI)) == "STOPPED,NOT_ENTRY_DAY"               # the last try
+    (row,) = _all(var)
+    ex = json.loads(row["exit"])
+    assert (row["state"], row["exit_reason"]) == ("CLOSED", "STOP_3X") and condor.reproduces(row)
+    assert ex["value_mid"] >= condor.STOP_MULT * row["credit"]
+    assert ex["fills"]["SP"]["real"] == pytest.approx(best_bid)           # never bought back under the best bid
+    assert ex["fills"]["SP"]["x2"] >= ex["fills"]["SP"]["real"] and row["net_2x"] <= row["net"]
+    last = _notes(var, "MARK")[-1]
+    assert "still a crossed or locked book at the last try" in last and "marked at its worse side" in last
+
+
+def test_a_crossed_leg_on_expiry_day_fails_nothing(week):
+    """No stop on expiry day, so a crossed leg there costs no retry: it is only marked, the short at its higher side
+    (it was marked at half its ask)."""
+    kite, rows, ctx, var = week
+    kite.book = priced(rows, at(WED))
+    assert condor.tick(ctx(WED)) == "ENTERED"
+    kite.book = priced(rows, at(EXPIRY), F=22010.0, td=1)
+    depth = kite.book["NFO:NIFTY26OCT22000PE"]["depth"]
+    depth["buy"][0]["price"] = round(depth["sell"][0]["price"] + 0.05, 2)
+    monday = ctx(EXPIRY)
+    monday.last_try = False
+    assert condor.tick(monday).startswith("MARKED_EXPIRY_DAY") and _notes(var, "MARK") == []
+
+    def mid(sym: str) -> float:
+        d = kite.book[sym]["depth"]
+        return (d["buy"][0]["price"] + d["sell"][0]["price"]) / 2
+
+    legs = {r: leg["symbol"] for r, leg in json.loads(_all(var)[0]["entry"])["legs"].items()}
+    con = condor.connect(var)
+    try:
+        (value,) = con.execute("SELECT value_mid FROM marks WHERE day = ?", (EXPIRY.isoformat(),)).fetchone()
+    finally:
+        con.close()
+    assert value == pytest.approx(depth["buy"][0]["price"] + mid(legs["SC"]) - mid(legs["LP"]) - mid(legs["LC"]))
+
+
+def test_job_tries_marked_last_on_the_third_or_when_no_retry_fits(tmp_path, monkeypatch):
+    seen: list[tuple[datetime, bool]] = []
+    monkeypatch.setattr(condor, "tick", lambda ctx, force=False: seen.append((ctx.now, ctx.last_try)) or "MARK_FAILED")
+    clock = Clock(at(WED, 15, 25))
+    job = condor.CondorJob(tmp_path, {}, clock, CAL, out=lambda s: None, kite_factory=lambda: object())
+    for t in (at(WED, 15, 25), at(WED, 15, 25, 45), at(WED, 15, 26, 30), at(WED, 15, 27, 15)):
+        clock.t = t
+        job.poll()
+        job.join(5)
+    assert seen == [(at(WED, 15, 25), False), (at(WED, 15, 25, 45), False), (at(WED, 15, 26, 30), True)]
+    late = condor.CondorJob(tmp_path / "late", {}, Clock(at(THU, 15, 28, 50)), CAL, out=lambda s: None,
+                            kite_factory=lambda: object())
+    late.poll()                                               # 45 s later would be after 15:29:30: its only try
+    late.join(5)
+    assert seen[-1] == (at(THU, 15, 28, 50), True)
+
+
+def _no_kite():
+    raise RuntimeError("no Kite session")
+
+
+def test_each_start_notes_the_15_25_duties_it_missed(week):
+    """Self-audit F4 (probe probe_missed_and_crossed P1, P2): with the laptop off on Thursday while NIFTY sat past the
+    stop, Friday's start wrote nothing and `condor status` showed nothing: nothing recorded that the stop check was
+    skipped, and nothing makes it up. Each start now writes a MISSED note, once, for every trading day since the
+    first tick with no completed tick while a condor was open (its 3x stop check) or due (the entry day of an expiry
+    the instruments listed at an earlier tick); a day with nothing open or due gets none. It needs no Kite."""
+    kite, rows, ctx, var = week
+    kite.rows = rows + opts(date(2026, 10, 27), tag="27OCT")              # the next weekly, entry day Thu 10-22
+    kite.book = priced(rows, at(WED))
+    assert condor.tick(ctx(WED)) == "ENTERED"
+    out: list[str] = []
+
+    def start(t: datetime) -> None:
+        job = condor.CondorJob(var, {}, Clock(t), CAL, out=out.append, kite_factory=_no_kite)
+        job.poll()                                            # the start step; its settlement needs Kite and fails
+        job.join(5)
+
+    start(at(THU, 9, 30))
+    start(at(THU, 15, 26))                                    # inside Thursday's window: not missed yet
+    assert _notes(var, "MISSED") == []
+    start(at(THU, 15, 31))                                    # a start after the window (F&O trades to 15:40)
+    want = ("2026-10-15: no 15:25 tick was completed (titan2 was not running then, or every try failed): skipped the "
+            "3x stop check of the 2026-10-19 condor")
+    assert _notes(var, "MISSED") == [want] and f"condor: {want}" in out
+    start(at(FRI, 9, 30))
+    start(at(FRI, 12, 0))
+    assert _notes(var, "MISSED") == [want]                    # once
+    assert f"  MISSED {want}" in condor.status_text(var).splitlines()
+    kite.book = priced(rows, at(FRI), td=1)                   # Friday's tick runs: a quiet mark
+    assert condor.tick(ctx(FRI)) == "HELD,NOT_ENTRY_DAY"
+    # off from Monday (the expiry: no stop check) to Thursday 10-22, the 10-27 condor's entry day (Wednesday 10-21:
+    #   nothing open, nothing due)
+    start(at(date(2026, 10, 23), 9, 30))
+    entry = ("2026-10-22: no 15:25 tick was completed (titan2 was not running then, or every try failed): skipped the "
+             "entry of the 2026-10-27 condor")
+    assert _notes(var, "MISSED") == [want, entry]
+    status = condor.status_text(var).splitlines()
+    assert status.index(f"  MISSED {entry}") + 1 == status.index(f"  MISSED {want}")         # the latest first
+    assert not [ln for ln in status if ln.startswith("  note ") and " MISSED: " in ln]       # listed once
+
+
+def test_missed_duties_follow_the_condor_and_the_calendar(tmp_path, monkeypatch):
+    """A stopped condor has no stop check after its stop; an expiry the calendar no longer has (moved for a new
+    holiday) is no entry day; a killed test has no entry due; the first tick's own day never counts."""
+    monkeypatch.setattr(condor, "reproduces", lambda r: True)              # the made-up row has no fills
+    con = condor.connect(tmp_path)
+    try:
+        con.execute("INSERT INTO ticks(day, ts, outcome) VALUES ('2026-10-14', 'x', 'ENTERED')")
+        con.execute("INSERT INTO condors(expiry, entry_day, state, qty, credit, credit_2x, max_loss, entry, exit_day, "
+                    "exit_reason, net, net_2x) VALUES ('2026-10-19', '2026-10-14', 'CLOSED', 65, 10.0, 9.0, 28000.0, "
+                    "'{}', '2026-10-15', 'STOP_3X', -100.0, -120.0)")
+        con.executemany("INSERT INTO expiries(expiry, seen) VALUES (?, '2026-10-14')",
+                        [("2026-10-27",), ("2026-10-20",)])     # 10-20 is a holiday in the calendar
+        con.commit()
+        now = at(date(2026, 10, 23), 9, 30)
+        assert [(d.isoformat(), w) for d, w in condor.missed_duties(con, CAL, now)] == [
+            ("2026-10-22", ["the entry of the 2026-10-27 condor"])]                # Fri 10-16: stopped on Thu
+        assert condor.missed_duties(con, CAL, at(date(2026, 10, 14), 16, 0)) == []  # the first tick's day
+        monkeypatch.setattr(condor, "kill_status", lambda rows: "DRAWDOWN: test")
+        assert condor.missed_duties(con, CAL, now) == []
+    finally:
+        con.close()
+
+
+def test_status_lists_the_latest_missed_days(tmp_path):
+    con = condor.connect(tmp_path)
+    try:
+        for d in range(12, 17):
+            condor.note(con, at(date(2026, 10, 19), 9, 30), "MISSED", f"2026-10-{d}: skipped something")
+    finally:
+        con.close()
+    lines = condor.status_text(tmp_path).splitlines()
+    assert [ln for ln in lines if ln.startswith("  MISSED")] == [
+        "  MISSED 2026-10-16: skipped something", "  MISSED 2026-10-15: skipped something",
+        "  MISSED 2026-10-14: skipped something", "  MISSED 2 earlier day(s) too (condor.db notes, kind MISSED)"]
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Review round 5 (2026-10-15): a late try knows it is the last; a mark made by a try whose entry step failed is no
+#   missed check
+# ---------------------------------------------------------------------------------------------------------------
+def _friday_past_the_stop_with_a_crossed_short(week):
+    """The F4 week: entered on Wednesday, a quiet mark on Thursday, then Friday past the 3x stop (NIFTY at 22,050)
+    with the short put's book crossed by one tick (its normal ask is now the bid). Thursday leaves the entry day's
+    close credit unknown (Kite gave no day bars), so Friday's try ends with that step's day-bar calls."""
+    kite, rows, ctx, var = week
+    kite.book = priced(rows, at(WED))
+    assert condor.tick(ctx(WED)) == "ENTERED"
+    kite.book = priced(rows, at(THU), td=2)
+    assert condor.tick(ctx(THU)) == "HELD,NOT_ENTRY_DAY"
+    kite.book = priced(rows, at(FRI), F=22050.0, td=1)
+    depth = kite.book["NFO:NIFTY26OCT22000PE"]["depth"]
+    best_bid = depth["sell"][0]["price"]
+    depth["buy"][0]["price"], depth["sell"][0]["price"] = best_bid, round(best_bid - 0.05, 2)
+    return kite, var, best_bid
+
+
+def _tries(monkeypatch) -> list[tuple[datetime, bool]]:
+    """(start, last_try) of every try the job starts; the real tick still runs."""
+    seen: list[tuple[datetime, bool]] = []
+    real = condor.tick
+    monkeypatch.setattr(condor, "tick", lambda ctx, force=False: seen.append((ctx.now, ctx.last_try))
+                        or real(ctx, force=force))
+    return seen
+
+
+def _passes(job, clock, start: datetime, end: datetime, step_s: float = 0.2) -> None:
+    """The supervisor's passes from start to end, step_s apart, each waiting for the try it starts."""
+    t = start
+    while t <= end:
+        clock.t = t
+        job.poll()
+        job.join(10)
+        t += timedelta(seconds=step_s)
+
+
+def test_a_try_that_runs_past_the_window_makes_the_stop_check_before_it_ends(week, monkeypatch):
+    """Review round 5 (probe probe_condor_lasttry, scenario A): a try started at 15:28:40 was not the last (45 s later
+    is 15:29:25), so its crossed short failed the mark ("tried again in 45 s"). A slow Kite day-bar call in a later
+    step then kept its thread running past 15:29:30, no other try could start, and the condor stayed OPEN past the
+    3x stop (Monday is expiry day, which has no stop). A try now asks again at its end whether another one can still
+    start in the window; when none can, it is the last, and it makes the check then: the short is marked at its
+    worse side and the stop fires."""
+    monkeypatch.setattr(condor, "KITE_PAUSE_S", 0.0)             # no real pauses between this fake Kite's calls
+    kite, var, best_bid = _friday_past_the_stop_with_a_crossed_short(week)
+    clock = Clock(at(FRI, 15, 28, 39))
+    job = condor.CondorJob(var, {}, clock, CAL, out=lambda s: None, kite_factory=lambda: kite)
+    job.poll()                                                    # the start's settle step
+    job.join(10)
+    seen = _tries(monkeypatch)
+    in_call, answered = threading.Event(), threading.Event()
+    real_hist = kite.historical_data
+
+    def slow(*a, **k):                                            # the close-credit step: Kite answers late
+        in_call.set()
+        assert answered.wait(10)
+        return real_hist(*a, **k)
+
+    kite.historical_data = slow
+    clock.t = at(FRI, 15, 28, 40)
+    job.poll()                                                    # try 1
+    assert in_call.wait(10)                                       # its mark is done; now it waits for Kite
+    t = clock.t
+    while t < at(FRI, 15, 29, 31):                                # the passes meanwhile start nothing
+        t += timedelta(seconds=0.2)
+        clock.t = t
+        job.poll()
+    answered.set()
+    job.join(10)
+    _passes(job, clock, at(FRI, 15, 29, 31), at(FRI, 15, 30))
+    assert seen == [(at(FRI, 15, 28, 40), False)]                 # one try, not the last when it began
+    (row,) = _all(var)
+    assert (row["state"], row["exit_reason"], row["exit_day"]) == ("CLOSED", "STOP_3X", FRI.isoformat())
+    assert json.loads(row["exit"])["fills"]["SP"]["real"] == pytest.approx(best_bid) and condor.reproduces(row)
+    marks = _notes(var, "MARK")
+    assert len(marks) == 3 and marks[0].endswith("the stop check is tried again in 45 s")
+    assert marks[1] == ("2026-10-19: no later try can start before 15:29:30: this try is the last, so the stop "
+                        "check is made now")
+    assert "still a crossed or locked book at the last try" in marks[2]
+    con = condor.connect(var)
+    try:
+        (outcome,) = con.execute("SELECT outcome FROM ticks WHERE day = ?", (FRI.isoformat(),)).fetchone()
+    finally:
+        con.close()
+    assert outcome == "STOPPED,NOT_ENTRY_DAY"
+
+
+def test_a_try_whose_retry_falls_between_two_passes_is_the_last(week, monkeypatch):
+    """Review round 5 (probe probe_condor_lasttry, scenario B): a fast try at 15:28:44.95 was not the last, since 45 s
+    later is 15:29:29.95. But the supervisor passes only every 0.2 s (here at .05, .25, ... s), so the first pass
+    after that point came at 15:29:30.05, outside the window: there was one try, and the crossed short hid the stop.
+    A try is now the last unless the next one fits with the pass interval and a little to spare."""
+    monkeypatch.setattr(condor, "KITE_PAUSE_S", 0.0)
+    kite, var, _ = _friday_past_the_stop_with_a_crossed_short(week)
+    first = at(FRI, 15, 28, 44) + timedelta(seconds=0.95)
+    clock = Clock(first - timedelta(seconds=0.2))
+    job = condor.CondorJob(var, {}, clock, CAL, out=lambda s: None, kite_factory=lambda: kite)
+    job.poll()                                                    # the start's settle step
+    job.join(10)
+    seen = _tries(monkeypatch)
+    clock.t = first
+    job.poll()
+    job.join(10)
+    _passes(job, clock, at(FRI, 15, 28, 45) + timedelta(seconds=0.05), at(FRI, 15, 30))
+    assert seen == [(first, True)]
+    (row,) = _all(var)
+    assert (row["state"], row["exit_reason"]) == ("CLOSED", "STOP_3X")
+    marks = _notes(var, "MARK")
+    assert len(marks) == 1 and "still a crossed or locked book at the last try" in marks[0]
+
+
+def test_a_stop_check_made_by_a_try_whose_entry_step_failed_is_not_missed(week):
+    """Review round 5 (probe probe_missed_false): on Thursday Kite's instruments call failed (no cached dump), so the
+    job's 3 tries all ended 'HELD,ENTRY_FAILED' and no tick was recorded, although each one marked the condor. The
+    next start then noted that Thursday's 3x stop check was skipped. missed_duties now looks at the marks: a day
+    whose mark of the open condor was made is no missed stop check."""
+    kite, rows, ctx, var = week
+    kite.book = priced(rows, at(WED))
+    assert condor.tick(ctx(WED)) == "ENTERED"
+    kite.book = priced(rows, at(THU), td=2)
+
+    def no_instruments(exchange):
+        raise RuntimeError("NetworkException: instruments timed out")
+
+    kite.instruments = no_instruments
+    assert [condor.tick(ctx(THU)) for _ in range(3)] == ["HELD,ENTRY_FAILED"] * 3
+    con = condor.connect(var)
+    try:
+        assert [r["day"] for r in con.execute("SELECT day FROM marks")] == [THU.isoformat()]
+        assert con.execute("SELECT COUNT(*) FROM ticks WHERE day = ?", (THU.isoformat(),)).fetchone()[0] == 0
+        assert condor.missed_duties(con, CAL, at(FRI, 9, 30)) == []
+        assert condor.record_missed(con, CAL, at(FRI, 9, 30)) == []
+    finally:
+        con.close()
+    assert _notes(var, "MISSED") == []

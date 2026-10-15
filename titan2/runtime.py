@@ -47,7 +47,16 @@ titan2's, e.g. EC2's, in the shared Kite account): HALT(UNKNOWN_POSITION, ACCOUN
 self-check runs phase "laptop" instead of "prestart"; the laptop runner's self-check halts are raised at boot; the
 Twisted reactor outlives the run (it cannot be restarted, and the runner restarts the bot in-process on exit 75 or
 3); the runner, not this module, installs the signal handlers (two-stage Ctrl+C). On Windows the log file is a plain
-FileHandler (there is no logrotate to rename it under a WatchedFileHandler).
+FileHandler (there is no logrotate to rename it under a WatchedFileHandler). Once the bot's own laptop self-check is
+done after prep, one INFO START_CARD goes to the phone (BotProcess._start_card): titan2 is up. One a session: the
+first run that gets that far sends it, and the runner's later in-process restarts do not (start_card, card_sent).
+
+Every profile: from 09:00 to 15:30 on a trading day lane-reads-quotes keeps Kite's connection warm
+(quotes_keep_warm); the alerter keeps what the network kept from going out and sends it later, the next start
+included (alerts.outbox_path). The engine context also gets, for information and display only (2026-10-14 night),
+the quote lane's measured calls (take_quote_calls), the alerter's counters (alert_counts) and, on the laptop, the
+paper condor's line for the 15:38 phone report (report_notes); the signals thread sends the first bars' pre-open
+volume with them (BarsClosed.preopen) for the bar check's detail.
 """
 
 from __future__ import annotations
@@ -63,7 +72,7 @@ import sys
 import threading
 import time
 from collections import deque
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time as dtime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
 
@@ -113,6 +122,9 @@ PREV_BARS_ABORT_AFTER = 5                   # consecutive historical failures (t
 ALERTS_FLUSH_S = 5.0
 DEADMAN_KEEP_TICK_S = 5.0                   # weekday without a session: heartbeat + WATCHDOG=1 this often
 RUN_MODES = frozenset({"SHADOW", "PAPER", "LIVE"})     # OFF strategies are not run (§10.5)
+KEEP_WARM_HOURS = (dtime(9, 0), dtime(15, 30))         # IST, trading days: Kite's quote connection is kept warm
+KEEP_WARM_QUIET_S = 3.0                                # ... except within 3 s of a whole minute (bar-close entries)
+START_CARD_WAIT_S = 5.0                                # the start card waits this long at most for StartSignals
 # the runtime's own last event of a run (the engine's SHUTDOWN phases STOPPING and EXIT come before it)
 FINAL_SHUTDOWN_PHASES = frozenset({"EXITED", "IDLE", "CRASHED"})
 _TERMINAL_SQL = "(" + ",".join(f"'{s.value}'" for s in sorted(TERMINAL_STRUCT)) + ")"
@@ -120,6 +132,24 @@ _TERMINAL_SQL = "(" + ",".join(f"'{s.value}'" for s in sorted(TERMINAL_STRUCT)) 
 
 def _no_feed() -> FeedHealth:
     return FeedHealth(False, None, None, 0, False)
+
+
+def quotes_keep_warm(clock: Clock, calendar: SessionCalendar) -> Callable[[], bool]:
+    """The reads lane's active(): from 09:00 to 15:30 IST on a trading day lane-reads-quotes keeps Kite's connection
+    warm (lanes.ReadsLane.keep_warm), so the 09:20 entries and every later quote find it open. Never within
+    KEEP_WARM_QUIET_S of a whole minute: the keep-warm call takes the quote bucket's token for a second, and a
+    60 s rhythm started at 09:00:00 would take it at 09:20:00, from opening_drive's batch (and at every bar close);
+    the lane looks again 5 s later."""
+    start, end = KEEP_WARM_HOURS
+
+    def active() -> bool:
+        now = clock.now_wall()
+        second = now.second + now.microsecond / 1e6
+        if second < KEEP_WARM_QUIET_S or second >= 60.0 - KEEP_WARM_QUIET_S:
+            return False
+        return start <= now.time() < end and calendar.is_trading_day(now.date())
+
+    return active
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -601,7 +631,8 @@ class SignalsHost:
     def _closed(self, bars: list[Bar]) -> None:
         if not bars:
             return
-        self._post(BarsClosed(tuple(bars)))
+        # the first bars' pre-open volume rides along, for the 15:36 bar check's detail (information only)
+        self._post(BarsClosed(tuple(bars), self.bars.take_preopen() if self.bars is not None else ()))
         self.hook_mono = self.clock.mono()
         for b in bars:
             self._hooks("on_bar_close", b)
@@ -760,7 +791,8 @@ class Prepper:
 
     def prev_bars(self) -> tuple[bool, str]:
         """The previous session's 5-min HIST bars for every stock in the universe: from titan2.db when already
-        stored (a restart), else from Kite (persisted through BarsClosed). The signals thread gets them all."""
+        stored complete (a restart: _complete), else from Kite (persisted through BarsClosed). The signals thread
+        gets them all."""
         inst = self.state.instruments()
         if inst is None:
             return False, "today's instruments are not loaded"
@@ -773,9 +805,11 @@ class Prepper:
         last_error = ""
         db = self._open_db()
         try:
+            stored = {sym: self._stored(db, sym, window) for sym in symbols}
+            latest = max((b.start for bars in stored.values() for b in bars), default=None)
             for sym in symbols:
-                bars = self._stored(db, sym, window)
-                if not _complete(bars, window):
+                bars = stored[sym]
+                if not _complete(bars, latest):
                     u = inst.underlying(sym)
                     try:
                         bars = [b for b in self.data.historical(sym, u.token, window[0], window[1], "5minute")
@@ -824,23 +858,31 @@ class Prepper:
         return [b for b in bars if window[0] <= b.start < window[1]]
 
 
-def _complete(bars: list[Bar], window: tuple[datetime, datetime]) -> bool:
+def _complete(bars: list[Bar], latest: datetime | None) -> bool:
     """Stored bars are reused only when they hold the session's close (the last 20 bars are what opening_drive
-    reads): >= PREV_BARS_MIN valid bars and one starting within the last two intervals."""
-    if sum(1 for b in bars if b.valid) < PREV_BARS_MIN:
+    reads): >= PREV_BARS_MIN valid bars and one starting at `latest`, the latest HIST bar stored for that session
+    (any stock's: they all come from fetches made after it closed). Since 2026-08-03 F&O stocks close by auction and
+    their last 5-minute bar is the 15:10 one, so the old test, a bar within 10 minutes of the 15:40 close, was never
+    met: every restart fetched all ~213 stocks again (about 75 s before signals start). Same bars, so no decision
+    changes."""
+    if latest is None or sum(1 for b in bars if b.valid) < PREV_BARS_MIN:
         return False
-    return max(b.start for b in bars) >= window[1] - timedelta(minutes=10)
+    return max(b.start for b in bars) >= latest
 
 
 class SelfcheckRunner:
     """RunSelfcheck: selfcheck.run_phase on a thread of its own, answered with SelfcheckResult. phases maps a
-    requested phase to the one run (the laptop profile runs "laptop" for the engine's "prestart")."""
+    requested phase to the one run (the laptop profile runs "laptop" for the engine's "prestart"). on_result, if
+    given, sees each result on that thread before it is posted (the laptop's start card); its failure is logged and
+    never keeps the result from the core."""
 
     def __init__(self, make_context: Callable[[str], Any], post: Callable[[Event], None],
-                 phases: Mapping[str, str] | None = None) -> None:
+                 phases: Mapping[str, str] | None = None,
+                 on_result: Callable[[SelfcheckResult], Any] | None = None) -> None:
         self._make_context = make_context
         self._post = post
         self._phases = dict(phases or {})
+        self._on_result = on_result
         self._thread: threading.Thread | None = None
 
     def run(self, phase: str) -> None:
@@ -858,6 +900,11 @@ class SelfcheckRunner:
         except Exception as exc:
             log.error("self-check %s did not run: %r", phase, exc, exc_info=True)
             res = SelfcheckResult(phase, False, None, repr(exc)[:300])
+        if self._on_result is not None:
+            try:
+                self._on_result(res)
+            except Exception:
+                log.exception("self-check %s: its follow-up failed", phase)
         self._post(res)
         return res
 
@@ -1280,8 +1327,11 @@ def _kite_ticker(api_key: str, access_token: str | None) -> Any:
 
 class BotProcess:
     """One run of `python -m titan2 bot` (§9.5), or of the laptop runner's session (laptop=True; None: the profile in
-    env decides). boot_halts are (kind, scope, clears, reason) raised at boot (the laptop self-check's). Every
-    outside dependency is injectable for tests."""
+    env decides). boot_halts are (kind, scope, clears, reason) raised at boot (the laptop self-check's); boot_alerts
+    are events.Alert commands sent as soon as the alerts thread runs (the laptop runner's restart notice).
+    start_card False: no START_CARD from this run (the laptop runner: its session's card went out already); after
+    the run, card_sent says whether this run's did (one card a session, from the first run that gets that far).
+    Every outside dependency is injectable for tests."""
 
     def __init__(self, *, safe: bool = False, env: Mapping[str, str] | None = None, clock: Clock | None = None,
                  calendar: SessionCalendar | None = None, notifier: Notifier | None = None,
@@ -1290,7 +1340,8 @@ class BotProcess:
                  check_kite: Callable[..., None] | None = None, install_signals: bool = True,
                  on_runtime: Callable[[Runtime], None] | None = None,
                  sleep: Callable[[float], Any] | None = None, laptop: bool | None = None,
-                 boot_halts: Iterable[tuple[str, str, Any, str]] = ()) -> None:
+                 boot_halts: Iterable[tuple[str, str, Any, str]] = (), boot_alerts: Iterable[Alert] = (),
+                 start_card: bool = True) -> None:
         self.env = dict(os.environ if env is None else env)
         self.laptop = laptop_mod.is_laptop(self.env) if laptop is None else bool(laptop)
         if self.laptop:
@@ -1304,6 +1355,11 @@ class BotProcess:
         self.allow_live_env = self.env.get("ALLOW_LIVE", "").strip() == "1"
         self.allow_live = self.allow_live_env and not self.laptop       # the laptop is PAPER only
         self.boot_halts = list(boot_halts)
+        self.boot_alerts = list(boot_alerts)
+        self.start_card = bool(start_card)
+        self.card_sent = False                          # this run's START_CARD reached its alerter while it ran
+        self._card_lock = threading.Lock()              # ... against the run's end (_run_with_alerts)
+        self._card_closed = False                       # the run's alerter is stopping: a card now would be lost
         self.kite_factory = kite_factory if kite_factory is not None else token_mod.kite_client
         self.ticker_factory = ticker_factory if ticker_factory is not None else _kite_ticker
         self.reactor = reactor
@@ -1353,8 +1409,9 @@ class BotProcess:
     def _fatal(self, text: str) -> int:
         """Exit 78 (systemd does not restart) with a CRITICAL alert sent directly (no alerts thread yet)."""
         log.critical("FATAL: %s (exit %d)", text, EXIT_FATAL)
-        try:
-            alerts.critical_now(f"titan2-bot will not start: {text}", code="BOT_FATAL", env=self.env)
+        try:                                                # undelivered (no network): the next start sends it
+            alerts.critical_now(f"titan2-bot will not start: {text}", code="BOT_FATAL", env=self.env,
+                                outbox=alerts.outbox_path(self.var))
         except Exception:
             log.exception("the fatal-start alert could not be sent")
         self.notifier.notify(f"STATUS=fatal: {text[:200]}")
@@ -1404,15 +1461,24 @@ class BotProcess:
 
     def _run_with_alerts(self, loaded: settings_mod.LoadResult) -> int:
         heartbeat = alerts.Heartbeat()
-        self.alerter = alerts.Alerter.from_env(self.env, heartbeat, clock=self.clock)
+        # what an earlier run could not deliver (alerts.OUTBOX_FILE) goes out first; this run's leftovers go there
+        self.alerter = alerts.Alerter.from_env(self.env, heartbeat, clock=self.clock,
+                                               outbox_file=alerts.outbox_path(self.var))
         self.alerter.start()
+        for note in self.boot_alerts:
+            try:
+                self.alerter.dispatch(note)
+            except Exception:
+                log.exception("boot alert %r could not be queued", note)
         code = EXIT_EXCEPTION_STORM
         try:
             code = self._serve(loaded, heartbeat)
         except Exception as exc:
             log.critical("titan2-bot crashed: %r", exc, exc_info=True)
-            self.alerter.submit("CRITICAL", "BOT_CRASHED", f"titan2-bot crashed ({exc!r}); systemd restarts it and "
-                                                           "recovery resumes the exits", "bot:crash")
+            restarts = ("its laptop runner restarts it (up to 5 times: BOT_RESTARTED)" if self.laptop
+                        else "systemd restarts it")
+            self.alerter.submit("CRITICAL", "BOT_CRASHED", f"titan2-bot crashed ({exc!r}); {restarts} and recovery "
+                                                           "resumes the exits", "bot:crash")
             code = EXIT_EXCEPTION_STORM
             # already reported: the next start must not report this run again as killed (BOT_KILLED)
             self._event("SHUTDOWN", {"phase": "CRASHED", "exit": code, "reason": repr(exc)[:300]}, "CRITICAL")
@@ -1421,6 +1487,8 @@ class BotProcess:
                 self.alerter.fail(f"titan2-bot exit {code}")
             elif code in (EXIT_OK, EXIT_RESTART):
                 self.alerter.ping_now()                     # the day's last ping comes after the check's last tick
+            with self._card_lock:                           # a START_CARD from now on would reach no phone: the
+                self._card_closed = True                    #   laptop runner's next run sends it (_start_card)
             self.alerter.stop(ALERTS_FLUSH_S)
         return code
 
@@ -1662,7 +1730,8 @@ class BotProcess:
                             clock=clock)
         rt.order_lane = lanes.OrderLane(broker, core_q.put, mono=clock.mono)
         rt.reads_lane = lanes.ReadsLane(KiteData(clients["reads"], clock=clock), core_q.put, quotes.put,
-                                        mono=clock.mono, quote_data=KiteData(clients["quotes"], clock=clock))
+                                        mono=clock.mono, quote_data=KiteData(clients["quotes"], clock=clock),
+                                        active=quotes_keep_warm(clock, calendar))
         exchange = PaperExchange(var / "db" / "paper_exchange.db", settings=settings, clock=clock, quotes=quotes,
                                  calendar=calendar, instruments=prep_state.contract,
                                  request_depth=lambda cmd: rt.reads_lane.submit(cmd, reply=rt.paper_sim.wake))
@@ -1687,7 +1756,8 @@ class BotProcess:
             rt.prep = PrepWorker(prepper.handlers(), core_q.put)
             rt.selfcheck = SelfcheckRunner(
                 lambda phase: self._selfcheck_context(phase, loaded, calendar, prep_state, api_key, access),
-                core_q.put, phases={"prestart": laptop_mod.SELFCHECK_PHASE} if self.laptop else None)
+                core_q.put, phases={"prestart": laptop_mod.SELFCHECK_PHASE} if self.laptop else None,
+                on_result=(lambda res: self._start_card(rt, res)) if self.laptop else None)
         feed, signals = rt.feed, rt.signals
         rt.ctx = EngineContext(
             settings=settings, calendar=calendar, clock=clock, quotes=quotes,
@@ -1703,11 +1773,55 @@ class BotProcess:
             unacked_critical=self.alerter.unacked_critical, pub_dir=var / "pub", reports_dir=var / "reports",
             exports_dir=var / "exports",
             command_dbs={"DASH": var / "dash" / "commands_dash.db", "CLI": var / "db" / "commands_cli.db"},
-            start_mono=self.start_mono)
+            start_mono=self.start_mono, take_quote_calls=rt.reads_lane.take_quote_calls,
+            alert_counts=getattr(self.alerter, "counters", None) or dict,
+            report_notes=self._report_notes if self.laptop else dict)
         if token_problem is not None:
             log.critical("token: %s: HALT(TOKEN); exits are impossible until a working session exists", token_problem)
             rt.boot_halts.append(("TOKEN", "GLOBAL", "AUTO", f"token check at start failed: {token_problem}"[:500]))
         return rt
+
+    def _report_notes(self) -> dict[str, str]:
+        """Laptop: the 15:38 phone report's note lines from outside the engine (EngineContext.report_notes): where the
+        PAPER condor stands, read-only (laptop.condor_brief never raises)."""
+        return {"condor": laptop_mod.condor_brief(self.var, self.env)}
+
+    def _start_card(self, rt: Runtime, res: SelfcheckResult) -> None:
+        """Laptop: one INFO phone message, START_CARD, once the bot's own laptop self-check is done after prep (the
+        engine sends RunSelfcheck and StartSignals together): titan2 is up, PAPER only, with the self-check's FAIL and
+        WARN rows, the clock, network and power rows, each strategy's mode and version and the PAPER condor. On a
+        quiet day it is what tells a running titan2 from a dead laptop: no card by 09:15 means titan2 is not running
+        (docs/LAPTOP.md section 3). Runs on the self-check thread, before the result reaches the core. One card a
+        session, from its first run that gets this far while it runs (start_card, card_sent; the laptop runner):
+        each in-process restart has a new alerter, so it went out again at each one (6 cards in a loop of 6
+        crashes), and a first run that ended before its self-check result left the session without one (review
+        rounds 5 and 6); the phone hears of a restart as BOT_RESTARTED. A result that comes after the run's alerter
+        began to stop (the self-check thread outlives its run) sends nothing: that card would be lost."""
+        if not self.start_card:
+            log.info("start card: not sent again (this session's card went out from an earlier run)")
+            return
+        signals = rt.signals
+        waited = threading.Event()
+        for _ in range(int(START_CARD_WAIT_S / 0.05)):
+            if signals is None or signals.enabled:
+                break
+            waited.wait(0.05)
+        try:
+            text = laptop_mod.start_card(res.report, error=res.error,
+                                         signals_on=signals is not None and signals.enabled,
+                                         versions=dict(rt.ctx.versions) if rt.ctx is not None else {},
+                                         modes=dict(rt.modes), condor=laptop_mod.condor_brief(self.var, self.env))
+        except Exception as exc:
+            log.exception("the start card could not be built")
+            text = (f"titan2 is up on the laptop: PAPER only; the rest of this card could not be built "
+                    f"({type(exc).__name__}): see the log")
+        with self._card_lock:
+            if self._card_closed:
+                log.warning("start card: not sent: this run ended before its self-check result came (a restarted "
+                            "run, if any, sends it)")
+                return
+            self.alerter.submit("INFO", "START_CARD", text, "start_card")
+            self.card_sent = True
 
     def _selfcheck_context(self, phase: str, loaded: settings_mod.LoadResult, calendar: SessionCalendar,
                            prep_state: PrepState, api_key: str, access: str | None) -> selfcheck.Context:

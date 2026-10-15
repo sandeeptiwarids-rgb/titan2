@@ -2,7 +2,11 @@
 
 The 09:15 bar (09:15:00-09:19:59.999) is built by market/bars.py from WS quote ticks: open = the exchange day open,
 high/low = LTP extremes including the open, close = the last LTP before 09:20:00, volume = cumulative volume_traded
-(pre-open included, [V] by the 15:36 bar check). The bar builder marks it invalid (FEED_GAP) when the feed dropped
+(pre-open auction included). That this is Kite's 09:15 volume was a [V] note the first full 15:36 bar check failed
+(2026-10-14: 0 of 23 first bars within 0.1% of Kite's volume, 10 beyond 5%; open and close exact): Kite's candle
+most likely leaves the pre-open auction out, which the bar check's detail now records to settle. Until it is
+settled, the 3x volume filter below sees auction-inclusive volume where the backtest's Kite candles did not; any
+change to that is a new version. The bar builder marks it invalid (FEED_GAP) when the feed dropped
 or ticks were lost during the bar, or no tick arrived; the feed counts as down until its first connect, so a late
 start is invalid too. That bar validity is the ground truth: an invalid bar skips the day (SKIP:INVALID_BAR). The
 host closes the 09:15 bars before it calls on_timer at or after 09:20:00.

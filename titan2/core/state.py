@@ -157,6 +157,13 @@ class EngineContext:
     take_dirty: Callable[[], frozenset[str]] = frozenset
     signals_degraded: Callable[[], bool] = lambda: False
     unacked_critical: Callable[[], int] = lambda: 0
+    # information only (2026-10-14 night), never an input to a decision: the quote lane's measured calls since the
+    #   last take (ReadsLane.take_quote_calls; the engine writes them into its once-a-minute LATENCY event), the
+    #   alerter's counters, and one-line notes from outside the engine for the 15:38 phone report (the laptop's
+    #   paper condor)
+    take_quote_calls: Callable[[], Any] = list
+    alert_counts: Callable[[], Mapping[str, int]] = dict
+    report_notes: Callable[[], Mapping[str, str]] = dict
     pub_dir: Path | None = None
     reports_dir: Path | None = None
     exports_dir: Path | None = None

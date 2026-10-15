@@ -652,6 +652,61 @@ def test_squareoff_on_a_book_that_stays_crossed_takes_its_worse_side(tmp_path, s
     assert rig.px.positions(PAPER)[0].net_qty == 0
 
 
+def _silent_feed_long(tmp_path) -> Rig:
+    """A long of 100 whose feed goes silent after its 15:25:58 packet (a thin option: KiteTicker sends nothing while
+    it does not trade)."""
+    rig = Rig(tmp_path / "p.db", start=f"{DAY}T15:20:00+05:30")
+    rig.set_book(**BOOK)
+    rig.place(qty=100, limit=10.05)
+    rig.run(3.1)
+    assert rig.px.positions(PAPER)[0].net_qty == 100
+    rig.clock.advance_to("15:25:58")
+    rig.feed()
+    rig.book = None
+    return rig
+
+
+@pytest.mark.parametrize("bids, asks, after_s, px", [
+    ([(10.50, 1000)], [(10.0, 1000)], 0.2, 10.0),      # crossed: sold at its ask, never above it (was Rs 0.05)
+    ([(10.0, 1000)], [(10.0, 1000)], 0.2, 10.0),       # locked: at that price (was Rs 0.05)
+    ([(10.50, 1000)], [(10.0, 1000)], 0.1, 10.0),      # the answer's arrival in the wait no longer matters
+    ([(10.50, 1000)], [(10.0, 1000)], 0.45, 10.0),
+    ([(10.50, 1000)], [(10.0, 1000)], 1.2, 10.0),
+    ([(9.95, 1000)], [(10.0, 1000)], 0.2, 9.95),       # control: a usable answer fills at once, at its bid
+], ids=["crossed", "locked", "crossed_at_0.1s", "crossed_at_0.45s", "crossed_at_1.2s", "usable"])
+def test_squareoff_on_a_silent_feed_fills_on_the_rest_answer_its_wait_got(tmp_path, bids, asks, after_s, px):
+    """Review round 4 (probes test_probe_sqoff_crossed_rest_only, test_probe_sqoff_rest_timing): on a silent feed the
+    square-off's only book is the REST answer its wait asks for. A crossed or locked answer is waited out, and if it
+    came in the first 0.5 s it was older than PAPER_BOOK_MAX_AGE_S (1 s) at the give-up (1.5 s), so it counted as no
+    book and the long was sold at the no-book Rs 0.05, which the docs said never happens. Any book received since the
+    wait began now counts at the give-up, filled at its worse side."""
+    rig = _silent_feed_long(tmp_path)
+    rig.clock.advance_to("15:26:00")
+    asked = len(rig.asked)
+    rig.px.step()                                             # no fresh book: it waits and asks REST
+    assert len(rig.asked) == asked + 1 and rig.asked[-1].symbols == (SYM,)
+    rig.clock.advance(after_s)
+    rig.cache.put(Quote(SYM, TOK, tuple(Level(p, q) for p, q in bids), tuple(Level(p, q) for p, q in asks), 10.0,
+                        None, None, None, rig.clock.mono(), rig.clock.now_wall(), "REST"))
+    rig.run(2.0)
+    (sq,) = [o for o in rig.px.orders_today(PAPER) if o.placed_by == "EXCHANGE"]
+    assert (sq.side, sq.qty, sq.status, sq.avg_px) == (Side.SELL, 100, "COMPLETE", px)
+    assert rig.px.positions(PAPER)[0].net_qty == 0
+
+
+def test_squareoff_never_fills_on_a_book_from_before_its_wait(tmp_path):
+    """The give-up takes a book older than PAPER_BOOK_MAX_AGE_S only when it came during the wait: a crossed packet
+    received before the wait began (it started the wait), with nothing after it, is no book at the give-up."""
+    rig = _silent_feed_long(tmp_path)
+    rig.clock.advance_to("15:25:59.500")
+    rig.cache.put(rig.quote(bids=[(10.50, 1000)], asks=[(10.0, 1000)], ltp=10.0))     # fresh, but crossed
+    rig.clock.advance_to("15:26:00")
+    rig.px.step()
+    rig.run(2.0)                                              # neither REST nor the feed answers
+    (sq,) = [o for o in rig.px.orders_today(PAPER) if o.placed_by == "EXCHANGE"]
+    assert (sq.qty, sq.avg_px) == (100, 0.05)
+
+
 # ---------------------------------------------------------------------------------------------------------------
 # determinism
 # ---------------------------------------------------------------------------------------------------------------

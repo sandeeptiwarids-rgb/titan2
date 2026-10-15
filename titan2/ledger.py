@@ -9,7 +9,10 @@
   fills at all a bot order is valued at its own LIMIT, which an IOC LIMIT can only have improved on (UNRESOLVED);
   an unpriced SELL the bot did not place is valued at 0 (UNRESOLVED). Bought and sold quantities that differ also
   make the row UNRESOLVED. G1 refuses every UNRESOLVED or ESTIMATED trade.
-- daily_report() is the 15:38 report per book and strategy (reports/<date>.md plus a Telegram summary).
+- daily_report() is the 15:38 report per book and strategy (reports/<date>.md plus a Telegram summary). Since
+  2026-10-14 night its phone text also gives the day's refusals and voids by reason, the saved what-if totals, the
+  runtime's notes (the laptop's condor), the bar check, the alerts delayed or not delivered and, per G1 line, whether
+  today counts for G1; its latency table has the quote calls' and broker reads' rows (the engine's LATENCY events).
 - pub/ files are written atomically (temp file, fsync, os.replace, mode 0640): the dashboard reads nothing else.
   The engine publishes after its transaction commits, so pub/ never shows a row that was rolled back.
 - export_session() writes exports/{events,trades}/<date>.jsonl.gz from the DB, which stays authoritative.
@@ -59,6 +62,11 @@ _REPLACE_BACKOFF_S = 0.01
 TRADES_90D_DAYS = 90
 EVENTS_TAIL_N = 500
 ACKS_N = 50
+# The daily report's measurement rows (2026-10-14 night). A quote call this long after the previous one counts as
+#   cold: broker.lanes.KEEP_WARM_IDLE_S, the keep-warm call's own threshold, so a cold call is one it did not prevent
+QUOTE_COLD_S = 60.0
+WHATIF_PREFIX = "whatif-"              # titan2.whatif.REPORT_PREFIX: reports/whatif-<date>.json, one per replayed day
+REASONS_SHOWN = 4                      # the phone report's refusal lines name this many reasons, then "+k more"
 _IN_CHUNK = 500
 _STATUS_RANK = {PnlStatus.FINAL: 0, PnlStatus.ESTIMATED: 1, PnlStatus.UNRESOLVED: 2}
 
@@ -664,11 +672,13 @@ def publish_trade_detail(store: Store, pub_dir: str | os.PathLike, structure_id:
 
 
 def publish_events_tail(store: Store, pub_dir: str | os.PathLike, now_wall: datetime, *, last_seq: int | None = None,
-                        n: int = EVENTS_TAIL_N) -> int:
-    """pub/events_tail.json (the last n events), written only when a newer event exists than last_seq.
+                        n: int = EVENTS_TAIL_N, debug: bool = False) -> int:
+    """pub/events_tail.json (the last n events), written only when a newer event exists than last_seq. DEBUG rows
+    (the minute's HEARTBEAT and LATENCY) are left out unless debug: at the 10-14 close they were 227 of the last
+    500, and the morning's refusals had already dropped out of the dashboard (2026-10-14 night).
 
     Returns the newest seq published, which the caller passes back as last_seq next time."""
-    events = store.events_tail(n)
+    events = store.events_tail(n, debug=debug)
     top = events[-1]["seq"] if events else 0
     if last_seq is not None and top == last_seq:
         return last_seq
@@ -862,13 +872,21 @@ def _checks(store: Store, session: date) -> dict[str, Any]:
                                                  "('CHARGES_CHECK','CHARGES_DRIFT')", (session,)))
     bars = store.query_one("SELECT COUNT(*) AS n, COALESCE(SUM(ok = 0), 0) AS bad FROM bar_checks "
                            "WHERE session = ?", (session,))
+    why: Counter = Counter()                       # the mismatches' reasons (VOLUME, OPEN, LIVE_MISSING, ...)
+    for r in store.query("SELECT detail FROM bar_checks WHERE session = ? AND ok = 0", (session,)):
+        try:
+            why.update(json.loads(r["detail"]).get("reasons") or ["?"])
+        except (TypeError, ValueError, AttributeError):
+            why.update(["?"])
     truth = []
     for r in store.query("SELECT account, payload FROM events WHERE session = ? AND kind = 'EOD_TRUTH_CHECK' "
                          "ORDER BY seq", (session,)):
         p = json.loads(r["payload"])
         truth.append({"account": r["account"] or p.get("account"), "ok": p.get("ok"),
                       "ledger_net": p.get("ledger_net"), "broker_net": p.get("broker_net")})
-    return {"vcn": dict(vcn), "bar_checks": {"n": bars["n"], "mismatched": bars["bad"]}, "eod_truth": truth}
+    return {"vcn": dict(vcn), "bar_checks": {"n": bars["n"], "mismatched": bars["bad"],
+                                             "reasons": dict(sorted(why.items(), key=lambda kv: (-kv[1], kv[0])))},
+            "eod_truth": truth}
 
 
 def _latencies(store: Store, session: date) -> dict[str, Any]:
@@ -906,18 +924,133 @@ def _latencies(store: Store, session: date) -> dict[str, Any]:
     gaps = [(b - a).total_seconds() for a, b in zip(beats, beats[1:])]
     stalls = [g for g in gaps if g > 2 * HEARTBEAT_EVERY_S]
     out["loop_stalls"] = {"n": len(stalls), "max_gap_s": _r(max(gaps), 1) if gaps else None}
+    measured = _measured_latencies(store, session)
+    rows = measured.pop("rows")
+    out.update({k: {"n": len(v), "p50": _r(_pctl(v, 50), 1), "p95": _r(_pctl(v, 95), 1)} for k, v in rows.items()})
+    out["max_ms"] = {k: _r(max(v), 1) for k, v in {**lat, **rows}.items() if v}
+    out.update(measured)
     return out
 
 
-def daily_report(store: Store, session: date, now_wall: datetime) -> DailyReport:
+def _measured_latencies(store: Store, session: date) -> dict[str, Any]:
+    """The LATENCY events' measurements (2026-10-14 night; the engine writes one a minute): the quote lane's calls
+    and every broker read's round trip. rows: the latency table's new rows, quote_call_ms (the whole call, the wait
+    for the 1-a-second token included: what a decision waited), quote_kite_ms (Kite's own answer time) and
+    read_ms:<ACCOUNT>:<KIND> (the engine's send to its answer); quote_calls: the counts the latency section's line
+    gives; read_failures: failed reads per account and kind."""
+    calls: list[dict[str, Any]] = []
+    reads: dict[str, list[float]] = defaultdict(list)
+    failed: Counter = Counter()
+    for r in store.query("SELECT payload FROM events WHERE session = ? AND kind = 'LATENCY' ORDER BY seq",
+                         (session,)):
+        try:
+            p = json.loads(r["payload"])
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(p, dict):
+            continue
+        qc, rd, rf = p.get("quote_calls"), p.get("reads"), p.get("read_failures")
+        calls += [c for c in qc if isinstance(c, dict)] if isinstance(qc, list) else []
+        for key, ms in (rd.items() if isinstance(rd, dict) else ()):
+            if isinstance(ms, list):
+                reads[str(key)] += [float(x) for x in ms if isinstance(x, (int, float)) and not isinstance(x, bool)
+                                    and math.isfinite(x) and x >= 0]
+        failed.update({str(k): v for k, v in (rf.items() if isinstance(rf, dict) else ())
+                       if isinstance(v, int) and not isinstance(v, bool)})
+    quotes = [c for c in calls if c.get("kind", "QUOTE") == "QUOTE"]
+    warm = [c for c in calls if c.get("kind") == "WARM"]
+
+    def num(c: Mapping[str, Any], key: str) -> float | None:
+        x = c.get(key)
+        return float(x) if isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) else None
+
+    def bad(c: Mapping[str, Any]) -> bool:
+        return not str(c.get("outcome", "")).startswith(("OK", "MISSING"))
+
+    cold = [c for c in quotes if num(c, "idle_s") is None or num(c, "idle_s") >= QUOTE_COLD_S]
+    rows: dict[str, list[float]] = {
+        "quote_call_ms": [x for c in quotes if (x := num(c, "ms")) is not None],
+        "quote_kite_ms": [x for c in quotes if (x := num(c, "kite_ms")) is not None]}
+    rows.update({f"read_ms:{key}": v for key, v in sorted(reads.items())})
+    cold_ms = [x for c in cold if (x := num(c, "ms")) is not None]
+    summary = {"n": len(quotes), "cold": len(cold),
+               "cold_pct": _r(len(cold) / len(quotes) * 100.0, 1) if quotes else None,
+               "cold_p50_ms": _r(_pctl(cold_ms, 50), 1), "failed": sum(1 for c in quotes if bad(c)),
+               "failures": dict(sorted(Counter(str(c.get("outcome")) for c in quotes if bad(c)).items())),
+               "missing": sum(1 for c in quotes if str(c.get("outcome", "")).startswith("MISSING")),
+               "retried": sum(1 for c in quotes if c.get("retried") is True),
+               "keep_warm": len(warm), "keep_warm_failed": sum(1 for c in warm if bad(c))}
+    return {"rows": rows, "quote_calls": summary, "read_failures": dict(sorted(failed.items()))}
+
+
+def _g1_today(store: Store, session: date, rows: Sequence[dict[str, Any]]) -> None:
+    """Each G1 row's "today": whether today counts for G1 as a clean day, in plain words (2026-10-14 night; display
+    only): yes; or no, with why: a mode G1 does not test, no running trial, a PAPER mismatch today (G1 fails every
+    later look of this version) or an IMPAIRED mark (its trades still count; the day uses the allowance)."""
+    from titan2 import g1 as g1_mod                    # g1 imports this module: imported at call time
+
+    day = session.isoformat()
+    flags = {r["strategy"]: r["detail"] for r in store.query(
+        "SELECT strategy, detail FROM session_flags WHERE session = ? AND flag = 'IMPAIRED'", (day,))}
+    for g in rows:
+        s = g["strategy"]
+        try:
+            if g["mode"] not in ("PAPER", "LIVE"):
+                g["today"] = f"no (mode {g['mode']}: G1 tests PAPER and LIVE strategies only)"
+            elif g["trial"] not in ("COLLECTING", "CONFIRMING"):
+                g["today"] = f"no (no running G1 trial: {g['trial'] or 'none registered'})"
+            elif (n := g1_mod.count_mismatches(store, g1_mod.paper_book(s), Account.PAPER.value, day, day)):
+                g["today"] = (f"no ({n} PAPER mismatch{'es' if n > 1 else ''} today: G1 fails every later look of "
+                              "this version)")
+            elif s in flags:
+                g["today"] = f"no (marked IMPAIRED: {flags[s]}; its trades still count, the day uses the allowance)"
+            else:
+                g["today"] = "yes"
+        except Exception as exc:                   # display only: never a reason to lose the report
+            g["today"] = f"unknown ({type(exc).__name__}; titan2 g1 {s} shows the trial)"
+
+
+def _whatif_totals(reports_dir: str | os.PathLike | None, session: date) -> dict[str, Any] | None:
+    """The saved what-if days up to `session` (reports/whatif-<date>.json, which `titan2 whatif` writes after each
+    session): days, refused entries replayed, winners and their net. At 15:38 today's has not run yet (today: False).
+    None without a reports folder."""
+    if reports_dir is None:
+        return None
+    days, n, won, net, today = 0, 0, 0, 0.0, False
+    for path in sorted(Path(reports_dir).glob(f"{WHATIF_PREFIX}*.json")):
+        day = path.stem[len(WHATIF_PREFIX):]
+        if day > session.isoformat():
+            continue
+        try:
+            rows = json.loads(path.read_text(encoding="utf-8")).get("rows") or []
+        except (OSError, ValueError, AttributeError):
+            continue
+        days += 1
+        today |= day == session.isoformat()
+        for r in rows if isinstance(rows, list) else ():
+            o = r.get("outcome") if isinstance(r, dict) else None
+            x = o.get("net") if isinstance(o, dict) else None
+            if isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x):
+                n, won, net = n + 1, won + (x > 0), net + float(x)
+    return {"days": days, "n": n, "won": won, "net": round_money(net), "today": today}
+
+
+def daily_report(store: Store, session: date, now_wall: datetime, *, reports_dir: str | os.PathLike | None = None,
+                 alerts: Mapping[str, int] | None = None, notes: Mapping[str, str] | None = None) -> DailyReport:
     """The 15:38 report: per book and strategy (n, WR_net, Exp_net, worst trade, charges, exit mix, slippage),
     refusals by gate (and paper orders not filled, by SIM reason), halts, WARN/CRITICAL events, paper-live twin
-    gaps, G1 progress, checks and latencies."""
+    gaps, G1 progress (and whether today counts for G1), checks and latencies (the quote calls and broker read
+    round trips included). Given by the engine, all display only: reports_dir (the saved what-if totals), alerts (the
+    alerter's counters) and notes (one line each from outside the engine: the laptop's condor)."""
+    g1_rows = _g1_progress(store)
+    _g1_today(store, session, g1_rows)
     data = {
         "session": session.isoformat(), "generated": iso(now_wall), "rates_version": rates_for(session).version,
         "books": _book_stats(store, session), "refusals": _refusals(store, session), "halts": _halts(store, session),
-        "events": _event_counts(store, session), "twins": _twins(store, session), "g1": _g1_progress(store),
+        "events": _event_counts(store, session), "twins": _twins(store, session), "g1": g1_rows,
         "checks": _checks(store, session), "latency": _latencies(store, session),
+        "whatif": _whatif_totals(reports_dir, session), "alerts": None if alerts is None else dict(alerts),
+        "notes": {str(k): str(v) for k, v in (notes or {}).items() if v},
     }
     return DailyReport(session, data, _render_markdown(data), _render_telegram(data))
 
@@ -966,25 +1099,117 @@ def _render_markdown(d: Mapping[str, Any]) -> str:
                     d["twins"])
     lines += ["## G1 progress", ""]
     lines += _table(["strategy", "version", "mode", "trial", "n", "sessions", "exp_pct", "lb_pct", "next_look",
-                     "futility_ub_pct"], d["g1"])
+                     "futility_ub_pct", "today"], d["g1"])
     c = d["checks"]
-    lines += ["## Checks", "", f"- VCN: {_cell(c['vcn'])}",
-              f"- Bar check: {c['bar_checks']['n']} checked, {c['bar_checks']['mismatched']} mismatched",
-              f"- EOD truth: {_cell(c['eod_truth'])}", "", "## Latencies (ms)", ""]
+    lines += ["## Checks", "", f"- VCN: {_cell(c['vcn'])}", f"- {_bar_check_line(c['bar_checks'])}",
+              f"- EOD truth: {_cell(c['eod_truth'])}"]
+    lines += [f"- {x}" for x in _side_lines(d) if x]
+    lines += ["", "## Latencies (ms)", ""]
     lat = d["latency"]
-    lines += _table(["what", "n", "p50", "p95"],
-                    [{"what": k, **v} for k, v in lat.items() if isinstance(v, dict) and "p50" in v])
+    top = lat.get("max_ms") or {}
+    lines += _table(["what", "n", "p50", "p95", "max"],
+                    [{"what": k, **v, "max": top.get(k)} for k, v in lat.items() if isinstance(v, dict) and "p50" in v])
     lines += [f"- p95 quote age at decision: {_cell(lat['decision_quote_age_ms_p95'])} ms",
               f"- loop stalls: {lat['loop_stalls']['n']} "
-              f"(max heartbeat gap {_cell(lat['loop_stalls']['max_gap_s'])} s)",
-              ""]
+              f"(max heartbeat gap {_cell(lat['loop_stalls']['max_gap_s'])} s)"]
+    if lat.get("quote_calls") is not None:
+        lines.append(f"- {_quote_calls_line(lat['quote_calls'])}")
+    if lat.get("read_failures"):
+        lines.append(f"- broker reads failed: {_counted(lat['read_failures'], shown=None)}")
+    lines.append("")
     return "\n".join(lines)
+
+
+def _counted(counts: Mapping[str, int], shown: int | None = REASONS_SHOWN) -> str:
+    """'BOOK_CAPS 24, COOLDOWN 15, +2 more': the largest first."""
+    items = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    keep = items if shown is None else items[:shown]
+    more = len(items) - len(keep)
+    return ", ".join(f"{k} {v}" for k, v in keep) + (f", +{more} more" if more else "")
+
+
+def _rs(x: float) -> str:
+    return f"{'+' if x >= 0 else '-'}Rs {abs(x):,.0f}"
+
+
+def _refusal_line(r: Mapping[str, Any]) -> str:
+    """The day's refusals by gate (no contract chosen yet), voids by reason (refused at the decision) and paper
+    orders not filled, in one line for the phone."""
+    gates: Counter = Counter()
+    for row in r["routes"]:
+        gates[row["gate"] or row["outcome"]] += row["n"]
+    voids: Counter = Counter()
+    for row in r["void"]:
+        voids[row["reason"]] += row["n"]
+    sims: Counter = Counter()
+    for row in r["sim"]:
+        sims[row["reason"]] += row["n"]
+    parts = [f"refused {sum(gates.values())}" + (f" ({_counted(gates)})" if gates else ""),
+             f"voided {sum(voids.values())}" + (f" ({_counted(voids)})" if voids else "")]
+    if sims:
+        parts.append(f"paper orders not filled {sum(sims.values())} ({_counted(sims)})")
+    return "; ".join(parts)
+
+
+def _bar_check_line(b: Mapping[str, Any]) -> str:
+    why = b.get("reasons") or {}
+    return f"bar check: {b['n']} checked, {b['mismatched']} mismatched" + (f" ({_counted(why)})" if why else "")
+
+
+def _whatif_line(w: Mapping[str, Any] | None) -> str | None:
+    if w is None:
+        return None
+    if not w["days"]:
+        return "what-if: no day saved yet (titan2 whatif runs after each session)"
+    when = "today included" if w["today"] else "saved days before today; today's runs after the session"
+    return (f"what-if ({when}): {w['n']} refused entr{'y' if w['n'] == 1 else 'ies'} replayed over {w['days']} "
+            f"day{'' if w['days'] == 1 else 's'}: net {_rs(w['net'])}, {w['won']} won")
+
+
+def _alerts_line(a: Mapping[str, int] | None) -> str | None:
+    """The alerter's counters (this run's: an in-process restart starts them again): sent, delayed by the network,
+    and not delivered (given up after 2 hours or past 200 kept, or dropped from a full queue)."""
+    if a is None:
+        return None
+
+    def n(key: str) -> int:
+        x = a.get(key, 0)
+        return x if isinstance(x, int) and not isinstance(x, bool) else 0
+
+    held, lost = n("held"), n("lost") + n("dropped")
+    waiting = max(0, held - n("resent") - n("lost"))
+    text = f"alerts this run: {n('sent')} sent"
+    text += f", {held} delayed by the network ({waiting} still waiting)" if held else ", none delayed"
+    return text + (f", {lost} not delivered (see the log)" if lost else ", none lost")
+
+
+def _note_lines(d: Mapping[str, Any]) -> list[str]:
+    """The notes from outside the engine (the laptop's condor), one line each."""
+    return [f"{k}: {v}" for k, v in sorted((d.get("notes") or {}).items())]
+
+
+def _side_lines(d: Mapping[str, Any]) -> list[str | None]:
+    """The what-if, condor (and any other note) and alert lines of the Checks section."""
+    return [_whatif_line(d.get("whatif")), *_note_lines(d), _alerts_line(d.get("alerts"))]
+
+
+def _quote_calls_line(q: Mapping[str, Any]) -> str:
+    if not q["n"] and not q["keep_warm"]:
+        return "quote calls: none measured"
+    cold = (f"cold (no quote call in the {QUOTE_COLD_S:.0f} s before) {q['cold']} ({_cell(q['cold_pct'])}%), median "
+            f"{_cell(q['cold_p50_ms'])} ms" if q["n"] else "")
+    fails = f"failed {q['failed']}" + (f" ({_counted(q['failures'])})" if q["failures"] else "")
+    parts = [f"quote calls: {q['n']}", cold, fails, f"retried {q['retried']}", f"symbols left out {q['missing']}",
+             f"keep-warm calls {q['keep_warm']} (failed {q['keep_warm_failed']})"]
+    return "; ".join(p for p in parts if p)
 
 
 def _render_telegram(d: Mapping[str, Any]) -> str:
     out = [f"titan2 {d['session']}"]
     for b in d["books"]:
-        out.append(f"{b['book']}: n={b['n']} WR {b['wr_net_pct']}% net ₹{b['net_rs']:.2f} "
+        name = b["book"] + (" (control trades, placebo: not a strategy result)" if b["book"].startswith("PLACEBO:")
+                            else "")
+        out.append(f"{name}: n={b['n']} WR {b['wr_net_pct']}% net ₹{b['net_rs']:.2f} "
                    f"(Exp ₹{b['exp_net_rs']:.2f}, worst ₹{b['worst']['net']:.2f}, "
                    f"charges ₹{b['charges_rs']:.2f})")
     if not d["books"]:
@@ -992,7 +1217,16 @@ def _render_telegram(d: Mapping[str, Any]) -> str:
     active = [h for h in d["halts"] if h["cleared_ts"] is None]
     crit = sum(e["n"] for e in d["events"] if e["severity"] == "CRITICAL")
     out.append(f"halts active {len(active)}, today {len(d['halts'])}; CRITICAL events {crit}")
+    # 2026-10-14 night: the phone heard only of trades; now also the day's refusals, the what-if, the condor, the bar
+    #   check, the alerts not delivered and whether today counts for G1 (display only)
+    out.append(_refusal_line(d["refusals"]))
+    whatif = _whatif_line(d.get("whatif"))
+    out += ([whatif] if whatif else []) + _note_lines(d)
+    out.append(_bar_check_line(d["checks"]["bar_checks"]))
+    alerts = _alerts_line(d.get("alerts"))
+    out += [alerts] if alerts else []
     for g in d["g1"]:
-        out.append(f"G1 {g['strategy']} {g['trial'] or 'no trial'}: n={_cell(g['n'])} sessions={_cell(g['sessions'])} "
-                   f"exp {_cell(g['exp_pct'])}% next look {_cell(g['next_look'])}")
+        line = (f"G1 {g['strategy']} {g['trial'] or 'no trial'}: n={_cell(g['n'])} sessions={_cell(g['sessions'])} "
+                f"exp {_cell(g['exp_pct'])}% next look {_cell(g['next_look'])}")
+        out.append(line + (f"; today counts for G1: {g['today']}" if g.get("today") else ""))
     return "\n".join(out)[:3500]

@@ -13,8 +13,10 @@ from titan2 import net
 
 @pytest.fixture
 def keep_gai(monkeypatch):
-    """Whatever a test does to urllib3's address family is undone after it."""
+    """Whatever a test does to urllib3's address family, and to its create_connection (remember_ipv4), is undone
+    after it."""
     monkeypatch.setattr(conn, "allowed_gai_family", conn.allowed_gai_family)
+    monkeypatch.setattr(conn, "create_connection", conn.create_connection)
 
 
 def test_force_ipv4_makes_urllib3_resolve_ipv4_only(keep_gai):

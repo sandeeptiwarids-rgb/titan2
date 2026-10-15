@@ -59,6 +59,7 @@ $KeyHelp = [ordered]@{
     TELEGRAM_BOT_TOKEN  = 'optional: Telegram alerts (a bot made with @BotFather)'
     TELEGRAM_CHAT_ID    = 'optional: your Telegram chat id'
     NTFY_TOPIC          = 'optional: a long random name for ntfy phone alerts (docs/LAPTOP.md)'
+    HEALTHCHECK_URL     = 'recommended: the healthchecks.io ping URL that rings when titan2 stops (docs/LAPTOP.md)'
 }
 $NeedKeys = @('ZERODHA_API_KEY', 'ZERODHA_API_SECRET', 'ZERODHA_USER_ID')
 $Probe = "import sys, struct, venv, ensurepip; print('%d.%d %d %s' % (sys.version_info[0], sys.version_info[1], " +

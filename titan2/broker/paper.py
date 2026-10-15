@@ -25,6 +25,9 @@ rejection by the simulated exchange is REJECTED "SIM: ...".
   cancelled. Never LTP.
 - Options have no pre-open: a quote received or exchange-stamped before the open + 30 s is a stale carry-over and
   is never filled against.
+- The log line of an order's fill (COMPLETE, or an IOC's partial or unfilled CANCELLED) names the book it filled
+  on (2026-10-14 night, the log only: _book_note): WS or REST, its receipt and exchange times, its age at the due
+  time, how long past due the fill came, the walked side's levels down to the limit and the order's draw.
 - Own persisted ledger, db/paper_exchange.db, written only by the paper-sim thread: p_orders (each API order with
   its bot book), p_fills (one row per filled level), p_meta. Positions are the signed sum of p_fills; margins are
   capital + sells - buys - charges for the day (charges.net_pnl, the one P&L function) less the funds OPEN orders
@@ -41,8 +44,10 @@ rejection by the simulated exchange is REJECTED "SIM: ...".
 - At BROKER_SQUAREOFF_AT each non-zero MIS position gets an EXCHANGE order tagged SQOFF that walks every shown level
   at participation 1.0 and fills the rest at the deepest level x 0.95 (sell) / x 1.05 (buy). It waits up to 1.5 s
   for a fresh book that is neither crossed nor locked; if only such a book comes, it fills on that one at its worse
-  side (a sell never above the best ask, a buy never under the best bid), never at the no-book Rs 0.05. It is never
-  emitted as a snapshot: recon finds it in orders() and books BROKER_SQUAREOFF (placed_by EXCHANGE, never "API").
+  side (a sell never above the best ask, a buy never under the best bid), never at the no-book Rs 0.05, even when
+  that book, received during the wait, is older than PAPER_BOOK_MAX_AGE_S by its end (a thin option's silent feed
+  and a REST answer early in the wait). It is never emitted as a snapshot: recon finds it in orders() and books
+  BROKER_SQUAREOFF (placed_by EXCHANGE, never "API").
 - No virtual contract note: contract_note() always raises ReadFailed (REJECTED SIM). This exchange could only bill
   with titan2.charges, the model the §8.1 check tests, so its "note" would agree with any RateSet, however wrong.
 - Broker reads pay a round trip too (decision B1, 2026-10-11): PaperSim answers a positions or orders read only
@@ -166,6 +171,32 @@ def _crossed(q: Quote) -> bool:
     """A crossed or locked book (best bid >= best ask): one side was left behind by a move of the other, which no
     exchange shows (paper model 2). A one-sided book is neither."""
     return bool(q.bids and q.asks) and q.bids[0].price >= q.asks[0].price - PRICE_EPS
+
+
+BOOK_LEVELS_LOGGED = 5                  # _book_note: the walked side's levels listed, best first
+
+
+def _book_note(q: Quote, row: sqlite3.Row, side: Side, now_wall: datetime, draw: float) -> str:
+    """The book an order was filled on, for its COMPLETE (or IOC) log line (2026-10-14 night: paper kept no record of
+    it, so paper-vs-live could not be audited; log line only, no schema change, no fill change): its source (WS or
+    REST), receipt and exchange times, how old it was at the order's due time (negative: it came after it, and the
+    order waited for it), how long past due the fill came, the walked side's levels down to the limit (price x qty,
+    best first) and the order's paper model 2 draw."""
+    due = parse_wall(row["due_ts"])
+    age_ms = (due - q.recv_wall).total_seconds() * 1000.0
+    late_ms = max(0.0, (now_wall - due).total_seconds() * 1000.0)
+    limit = float(row["limit_px"])
+    levels = q.asks if side is Side.BUY else q.bids
+    walked = [lv for lv in levels if (lv.price <= limit + PRICE_EPS if side is Side.BUY
+                                      else lv.price >= limit - PRICE_EPS)]
+    shown = " ".join(f"{lv.price:.2f}x{lv.qty}" for lv in walked[:BOOK_LEVELS_LOGGED]) or "none"
+    if len(walked) > BOOK_LEVELS_LOGGED:
+        shown += f" (+{len(walked) - BOOK_LEVELS_LOGGED} more)"
+    exch = f"{q.exch_wall:%H:%M:%S}" if q.exch_wall is not None else "none"
+    age = f"{age_ms:.0f} ms old at the due time" if age_ms >= 0 else f"it came {-age_ms:.0f} ms after the due time"
+    return (f"book {q.source} received {q.recv_wall:%H:%M:%S}.{q.recv_wall.microsecond // 1000:03d} (exchange "
+            f"{exch}), {age}, filled {late_ms:.0f} ms past due; {'asks' if side is Side.BUY else 'bids'} to the "
+            f"limit {limit:.2f}: {shown}; draw {draw:.4f}")
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -416,7 +447,7 @@ class PaperExchange:
         #   SIM reason)
         self._decided_exch: dict[str, datetime | None] = {}
         self._unusable: dict[str, str] = {}
-        self._sqoff_wait: dict[tuple[Account, str], float] = {}
+        self._sqoff_wait: dict[tuple[Account, str], float] = {}   # square-off waiting for depth -> wait's start mono
         self._sqoff_done: set[tuple[Account, date]] = set()   # mirrors p_meta last_squareoff_session
         self._rngs: dict[tuple[Account, date], random.Random] = {}
         self._read_rngs: dict[tuple[Account, date], random.Random] = {}
@@ -624,12 +655,12 @@ class PaperExchange:
         filled = sum(f[2] for f in fills)
         msg = (None if filled == row["qty"] else "SIM: IOC unfilled" if filled == 0
                else f"SIM: IOC partial fill {filled}/{row['qty']}")
-        self._finish(row, fills, msg, now_mono, now_wall)
+        self._finish(row, fills, msg, now_mono, now_wall, book=_book_note(q, row, side, now_wall, draw))
 
     def _finish(self, row: sqlite3.Row, fills: Sequence[tuple[int, float, int]], msg: str | None,
-                now_mono: float, now_wall: datetime) -> None:
+                now_mono: float, now_wall: datetime, *, book: str | None = None) -> None:
         """Make an OPEN order terminal with these fills: p_fills rows and the order in one transaction, then queue
-        its terminal snapshot (API orders)."""
+        its terminal snapshot (API orders). book: the fill book's note for the log line (_book_note)."""
         oid = row["broker_order_id"]
         filled = sum(q for _, _, q in fills)
         value = math.fsum(px * q for _, px, q in fills)
@@ -646,14 +677,14 @@ class PaperExchange:
         self._placed.pop(oid, None)
         self._decided_exch.pop(oid, None)
         self._unusable.pop(oid, None)
-        log.info("paper order %s %s %s: %d/%d filled%s", oid, row["tag"], status, filled, row["qty"],
-                 f" avg {value / filled:.4f}" if filled else "")
+        log.info("paper order %s %s %s: %d/%d filled%s%s", oid, row["tag"], status, filled, row["qty"],
+                 f" avg {value / filled:.4f}" if filled else "", f"; {book}" if book else "")
         if row["placed_by"] == API:
             self._outbox.append(snapshot_of(_broker_order(self._row(oid)), SIM, now_mono))
 
     def _fill_quote(self, symbol: str, now_mono: float, newer_than: float | None = None,
-                    decided_exch: datetime | None = None,
-                    crossed_ok: bool = False) -> tuple[Quote | None, str | None]:
+                    decided_exch: datetime | None = None, crossed_ok: bool = False,
+                    max_age_s: float | None = None) -> tuple[Quote | None, str | None]:
         """(the book at fill time, None), or (None, why) when there is none: why is None when no fresh book was
         received after newer_than, else the SIM reason the newest one cannot be used.
 
@@ -664,8 +695,10 @@ class PaperExchange:
         decided_exch, that of the quote the order was decided on: a WS packet that left the exchange before that
         quote but reached us after the order (feed lag) shows a market that was already gone. Kite stamps whole
         seconds, so two quotes within one second are never told apart. crossed_ok: a crossed or locked book counts
-        too (the square-off's last resort, which fills it at its worse side)."""
-        q = self._quotes.fresh(symbol, self._settings.PAPER_BOOK_MAX_AGE_S, now_mono)
+        too (the square-off's last resort, which fills it at its worse side). max_age_s replaces PAPER_BOOK_MAX_AGE_S
+        (the square-off's give-up: any book received since its wait began)."""
+        max_age = self._settings.PAPER_BOOK_MAX_AGE_S if max_age_s is None else max_age_s
+        q = self._quotes.fresh(symbol, max_age, now_mono)
         if q is None or (newer_than is not None and q.recv_mono <= newer_than):
             return None, None
         valid_from = self._calendar.quotes_valid_from(session_of(q.recv_wall))
@@ -691,8 +724,9 @@ class PaperExchange:
     def _maybe_squareoff(self, now_mono: float, now_wall: datetime) -> None:
         """At BROKER_SQUAREOFF_AT, once per session and account: every non-zero MIS position is closed by the
         exchange (DETAIL §6.6). It waits for the account's OPEN orders to resolve and for depth (up to 1.5 s). A
-        crossed or locked book is waited out like a missing one; if the wait ends with only such a book, the
-        position is closed on it at its worse side, never at the no-book fallback (Rs 0.05 for a long)."""
+        crossed or locked book is waited out like a missing one; if the wait ends with only such a book, received
+        since the wait began however old it is by then, the position is closed on it at its worse side, never at
+        the no-book fallback (Rs 0.05 for a long)."""
         session = session_of(now_wall)
         if not self._calendar.is_trading_day(session):
             return
@@ -713,18 +747,21 @@ class PaperExchange:
                 q, _ = self._fill_quote(symbol, now_mono)      # a crossed or locked book is waited out, as none
                 wkey = (account, symbol)
                 if q is None:
-                    give_up = self._sqoff_wait.get(wkey)
-                    if give_up is None:
-                        self._sqoff_wait[wkey] = now_mono + PAPER_DEPTH_WAIT_S
+                    began = self._sqoff_wait.get(wkey)
+                    if began is None:
+                        self._sqoff_wait[wkey] = now_mono
                         self._ask_depth(symbol, account, f"sqoff:{account}:{symbol}")
                         pending = True
                         continue
-                    if now_mono < give_up:
+                    if now_mono < began + PAPER_DEPTH_WAIT_S:
                         pending = True
                         continue
-                    # the wait is over: a fresh book that is only crossed or locked is still a book, filled at its
-                    #   worse side (_sqoff_fills); a stale side is no reason to sell a long at Rs 0.05
-                    q, _ = self._fill_quote(symbol, now_mono, crossed_ok=True)
+                    # the wait is over: a book that is only crossed or locked is still a book, filled at its worse
+                    #   side (_sqoff_fills); a stale side is no reason to sell a long at Rs 0.05. Any book received
+                    #   since the wait began counts, also when it is older than PAPER_BOOK_MAX_AGE_S by now: on a thin
+                    #   option's silent feed the only book can be the REST answer early in the wait (review round 4).
+                    #   A book from before the wait never does.
+                    q, _ = self._fill_quote(symbol, now_mono, crossed_ok=True, max_age_s=now_mono - began)
                     if q is None:
                         log.warning("%s square-off of %s: no fresh depth; conservative fill", account, symbol)
                     else:

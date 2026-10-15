@@ -1,6 +1,7 @@
 """The laptop self-check phase (titan2/selfcheck.py LAPTOP_CHECKS): the Windows laptop profile's rows (Python and its
 packages, the env file, the token, the clock against internet time, the calendar, the instruments dump, disk, the
-DB, settings, AC power, LIVE off), their effects (every FAIL an entry halt, never an exit) and the laptop paths.
+DB, settings, AC power, the lid, a pending restart, update hours, auto-connecting Wi-Fi, LIVE off), their effects
+(every FAIL an entry halt, never an exit) and the laptop paths.
 
 Offline and deterministic: titan2.laptop (ctypes, NTP, HTTP) is a scripted fake (or the real module with those calls
 replaced), the host a fake System and Kite a fake profile(); no real env file, session or secret is ever read.
@@ -36,11 +37,12 @@ GB = 1024 ** 3
 API_KEY, USER = "kiteapikey01", "AB1234"
 API_SECRET, PASSWORD, TOTP_SECRET = "ApiSecretValue-77f1", "Password-Hunter2", "TOTPSECRETBASE32XYZ"
 TG_TOKEN, ACCESS_TOKEN = "123456:TelegramTokenValue-q9", "AcTok9876543210fedcbaXYZ"
-SECRETS = (API_SECRET, PASSWORD, TOTP_SECRET, TG_TOKEN, ACCESS_TOKEN)
+HC_URL = "https://hc-ping.com/9a8b7c6d-HealthcheckSecret-55"
+SECRETS = (API_SECRET, PASSWORD, TOTP_SECRET, TG_TOKEN, ACCESS_TOKEN, HC_URL)
 NOW = datetime(2026, 10, 12, 8, 50, tzinfo=IST)             # a Monday, a trading day
 LATE = datetime(2026, 12, 14, 8, 50, tzinfo=IST)            # the calendar ends 2026-12-31: < 30 days ahead
 ROWS = ["python", "env_file", "token", "clock", "network", "calendar", "instruments", "disk", "db", "settings",
-        "power", "live_disabled"]
+        "power", "lid", "restart_pending", "update_hours", "wifi", "notify", "live_disabled"]
 # Copied independently of the code: row -> (status of a failure, the entry halt it raises, alert severity).
 EXPECTED = {
     "python":        ("FAIL", ("INVARIANT", "GLOBAL", HaltClears.ACK), "CRITICAL"),
@@ -54,28 +56,59 @@ EXPECTED = {
     "db":            ("FAIL", ("INVARIANT", "GLOBAL", HaltClears.ACK), "CRITICAL"),
     "settings":      ("FAIL", ("SETTINGS_INVALID", "GLOBAL", HaltClears.AUTO), "CRITICAL"),
     "power":         ("WARN", None, "WARN"),
+    # laptop settings that can end a session (2026-10-14 night): WARN, no alert of their own (the start card lists them)
+    "lid":             ("WARN", None, None),
+    "restart_pending": ("WARN", None, None),
+    "update_hours":    ("WARN", None, None),
+    "wifi":            ("WARN", None, None),
+    "notify":        ("WARN", None, None),          # no alert of its own: the bot's start card lists it
     "live_disabled": ("FAIL", ("LIVE_DISABLED_TODAY", "ACCOUNT:LIVE", HaltClears.NEXT_SESSION), "CRITICAL"),
 }
 ENV_FILE_VALUES = {"ZERODHA_API_KEY": API_KEY, "ZERODHA_API_SECRET": API_SECRET, "ZERODHA_USER_ID": USER,
                    "ZERODHA_PASSWORD": PASSWORD, "ZERODHA_TOTP_SECRET": TOTP_SECRET, "TELEGRAM_BOT_TOKEN": TG_TOKEN,
-                   "TELEGRAM_CHAT_ID": "4242"}
+                   "TELEGRAM_CHAT_ID": "4242", "HEALTHCHECK_URL": HC_URL}
 LAPTOP_ENV = {"TITAN2_PROFILE": "laptop", "ZERODHA_API_KEY": API_KEY, "ZERODHA_USER_ID": USER}  # no secret in it
 
 
 class FakeLaptop:
     """The titan2.laptop surface the rows use: is_laptop(env), clock_offset_s() (seconds to add to this clock for
     internet time, a bare number or a ClockOffset carrying its error; None when no source answered), power_status()
-    ({"on_ac", "battery_pct"}), network_probe() (a titan2.net.Probe) and LIVE_REFUSED_REASONS.
+    ({"on_ac", "battery_pct"}), network_probe() (a titan2.net.Probe), the session-ending settings (lid_close_action()
+    (AC, DC) and LID_ACTIONS, restart_pending(), update_active_hours() (start, end), wifi_auto_connect() (the
+    auto-connecting names, how many were read); None: unreadable) and LIVE_REFUSED_REASONS.
     No ctypes and no network: each answer is scripted (an exception instance is raised instead)."""
 
     LIVE_REFUSED_REASONS = ("SEBI requires a registered static IP for API orders, which a laptop does not have",
                             "a laptop has no backstop if it sleeps, loses Wi-Fi or reboots")
+    LID_ACTIONS = {0: "do nothing", 1: "sleep", 2: "hibernate", 3: "shut down"}
 
     def __init__(self) -> None:
         self.offset: object = 0.12
         self.power: object = {"on_ac": True, "battery_pct": 100}
         self.net: object = Probe("api.kite.trade", 8, 8, 0, 23.0, 31.0)
+        self.lid: object = (0, 1)                   # plugged in: do nothing; on battery: sleep
+        self.restart: object = False
+        self.hours: object = (7, 1)                 # 07:00-01:00, the advised active hours
+        self.wifi: object = (["Home"], 3)
         self.envs: list = []
+
+    @staticmethod
+    def _answer(x: object) -> object:
+        if isinstance(x, BaseException):
+            raise x
+        return x
+
+    def lid_close_action(self):
+        return self._answer(self.lid)
+
+    def restart_pending(self):
+        return self._answer(self.restart)
+
+    def update_active_hours(self):
+        return self._answer(self.hours)
+
+    def wifi_auto_connect(self):
+        return self._answer(self.wifi)
 
     def is_laptop(self, env) -> bool:
         self.envs.append(env)
@@ -223,6 +256,10 @@ def test_laptop_healthy_every_row_passes(tmp_path, lap):
     assert detail["disk"] == f"disk 50.0 GB free at {kw['var_dir']}"
     assert detail["power"] == "on AC power (battery 100%)"
     assert detail["network"] == "IPv4 to api.kite.trade: 8/8 connects, median 23 ms (worst 31 ms)"
+    assert detail["lid"] == "closing the lid while plugged in: do nothing; on battery: sleep"
+    assert detail["restart_pending"] == "no Windows restart pending"
+    assert detail["update_hours"] == "Windows Update's active hours 07:00-01:00 cover 08:00-16:00"
+    assert detail["wifi"] == "1 of 3 saved Wi-Fi networks connects automatically (Home)"
     assert detail["token"].startswith(f"user {USER}; session ")
     assert "refuses LIVE (SEBI requires a registered static IP" in detail["live_disabled"]
 
@@ -230,6 +267,9 @@ def test_laptop_healthy_every_row_passes(tmp_path, lap):
 def test_laptop_failures_halt_entries_and_never_exit(tmp_path, lap):
     lap.offset, lap.power = 1.5, {"on_ac": False, "battery_pct": 41}   # beyond 1 s: entries stop
     lap.net = Probe("api.kite.trade", 8, 5, 1, 120.0, 1300.0, "TimeoutError: timed out")
+    # the 10-14 laptop: lid sleeps on AC, a restart pending, active hours 09:00-02:00, 8 of 9 networks auto-connect
+    lap.lid, lap.restart, lap.hours = (1, 1), True, (9, 2)
+    lap.wifi = (["Home", "Office", "Cafe 5G", "Phone hotspot", "a", "b", "c", "d"], 9)
     var = tmp_path / "var"
     make_db(var, user_version=99)                                  # a schema newer than this release
     (var / "config").mkdir(parents=True)
@@ -255,7 +295,9 @@ def test_laptop_failures_halt_entries_and_never_exit(tmp_path, lap):
     tok = next(h for h in report.halts() if h.kind == "TOKEN")                # env_file and token share it
     assert tok.reason.startswith("selfcheck laptop: env_file: ") and len(tok.reason) <= selfcheck.HALT_REASON_MAX
     assert {(a.code, a.severity) for a in report.alert_commands()} == {
-        (f"SELFCHECK_{n.upper()}", EXPECTED[n][2]) for n in ROWS}
+        (f"SELFCHECK_{n.upper()}", EXPECTED[n][2]) for n in ROWS if EXPECTED[n][2] is not None}
+    assert report.result("notify").status == "WARN" and "SELFCHECK_NOTIFY" not in {
+        a.code for a in report.alert_commands()}                    # the start card carries it: one message, not two
     assert report.severity() == "CRITICAL"
     # the core takes them as they are: each one it can raise, the report travelling in a SelfcheckResult
     for h in report.halts():
@@ -539,11 +581,22 @@ def test_laptop_rows_with_the_real_laptop_module(tmp_path, monkeypatch):
     inspect.signature(real.is_laptop).bind({})
     inspect.signature(real.clock_offset_s).bind()
     inspect.signature(real.power_status).bind()
+    for probe in (real.lid_close_action, real.restart_pending, real.update_active_hours, real.wifi_auto_connect):
+        inspect.signature(probe).bind()                  # the rows call them without arguments
     monkeypatch.setattr(real, "clock_offset_s", lambda timeout_s=2.0: real.ClockOffset(-0.4, 0.012,
                                                                                        "NTP time.windows.com"))
     monkeypatch.setattr(real, "power_status", lambda kernel32=None: real.PowerStatus(on_ac=False, battery_pct=41))
+    # the host's real settings are never read here: the tools' answers are scripted (test_measurement_and_housekeeping
+    #   parses real powercfg and netsh output)
+    monkeypatch.setattr(real, "lid_close_action", lambda run=None: (0, 1))
+    monkeypatch.setattr(real, "restart_pending", lambda reg=None: None)
+    monkeypatch.setattr(real, "update_active_hours", lambda reg=None: (9, 2))
+    monkeypatch.setattr(real, "wifi_auto_connect", lambda run=None: (["Home"], 2))
     monkeypatch.setattr(titan2, "laptop", real)
     report = run(tmp_path)
+    assert report.result("lid").detail == "closing the lid while plugged in: do nothing; on battery: sleep"
+    assert report.result("restart_pending").status == "SKIP"            # unreadable: SKIP, never FAIL
+    assert report.result("update_hours").status == "WARN" and "09:00-02:00" in report.result("update_hours").detail
     assert report.result("clock").detail == ("this clock is 0.400 s ahead of internet time (+-0.012 s, NTP "
                                              "time.windows.com)")
     assert report.result("power").status == "WARN"
@@ -641,7 +694,7 @@ def test_laptop_cli(tmp_path, lap, monkeypatch):
     kw = laptop_kw(tmp_path)
     assert selfcheck.cli(selfcheck.LAPTOP, out=out.append, **kw) == 0
     lines = out[0].splitlines()
-    assert lines[0] == "titan2 self-check laptop 2026-10-12 08:50: PASS (0 fail, 0 warn, 12 pass, 0 skip)"
+    assert lines[0] == "titan2 self-check laptop 2026-10-12 08:50: PASS (0 fail, 0 warn, 17 pass, 0 skip)"
     assert [ln.split(":")[0] for ln in lines[1:]] == [f"PASS {n}" for n in ROWS]          # every row is printed
     saved = json.loads(next((kw["var_dir"] / "reports").glob("selfcheck-*-laptop.json")).read_text(encoding="utf-8"))
     assert (saved["phase"], saved["ok"], saved["fatal"], saved["exit_code"]) == ("laptop", True, False, 0)

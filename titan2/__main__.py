@@ -439,7 +439,7 @@ def cmd_report(var: Path, day: date, now_wall: datetime, out: Out) -> int:
     if st is None:
         return EXIT_FAILED
     try:
-        out(ledger.daily_report(st, day, now_wall).markdown)
+        out(ledger.daily_report(st, day, now_wall, reports_dir=var / "reports").markdown)
     finally:
         st.close()
     return EXIT_OK

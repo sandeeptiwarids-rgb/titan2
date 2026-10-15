@@ -519,6 +519,42 @@ def test_docs_units_and_schedules_match_ops() -> None:
     assert not problems, "\n".join(problems)
 
 
+def test_docs_laptop_deadman_check_fits_a_start_by_hand() -> None:
+    """Review round 5: the laptop's docs gave the server's dead-man schedule (first tick 08:45), which rang the phone
+    for every start after about 08:46 and for every early stop. docs/LAPTOP.md section 2 and the Windows env example
+    now give the laptop's own, alerts.LAPTOP_DEADMAN_SCHEDULE (from 09:15; tests/unit/test_alerts_token_selfcheck.py
+    plays a day on it), with its grace, and say to pause the check on NSE holidays and when stopping early, as
+    section 4 does too. Review round 6: they said to pause it before an early stop, but titan2 pings while it stops
+    (through the Ctrl+C flatten, and once more as it exits) and a ping resumes a paused check, which then rang 3 to 4
+    minutes after the exit. They now say to pause it after titan2 has stopped, within a minute of the window saying
+    so (the same test plays that stop on the schedule, with this advice read from section 4)."""
+    from titan2 import alerts, laptop as laptop_mod, runtime
+
+    laptop = _read(LAPTOP)
+    (row,) = [" ".join(r) for r in _table_rows(_section(laptop, "2. Fill in the env file (your secrets)"))
+              if r[0] == "`HEALTHCHECK_URL`"]
+    env = _flat(_read(ROOT / "ops" / "windows" / "titan2.env.example").replace("#", " "))
+    assert "titan2.alerts.LAPTOP_DEADMAN_SCHEDULE" in env and "45-59 8" not in row + env
+    for line in alerts.LAPTOP_DEADMAN_SCHEDULE:
+        assert f"`{line}`" in row and line in env, line
+    assert f"grace {alerts.DEADMAN_GRACE_MIN} minutes" in row and f"{alerts.DEADMAN_GRACE_MIN} minutes grace" in env
+    for text in (_flat(row), env):
+        assert "a few minutes after you start it" in text and "09:10" in text
+        assert "Pause the check on NSE holidays" in text and "its next ping resumes it" in text
+        assert ("when you stop titan2 before 15:33 pause it after titan2 has stopped, within a minute (not before: "
+                "titan2 pings it while it stops") in text
+        assert "before you stop titan2 before 15:33" not in text           # the advice that rang the phone
+    stop = _flat(_section(laptop, "4. How to stop safely"))
+    assert ("**The dead-man check.** When you stop titan2 before 15:33, pause its check on healthchecks.io (the "
+            "check's Pause button) after titan2 has stopped: once the window says `titan2 stopped cleanly`, within a "
+            "minute") in stop
+    assert "Not before: titan2 pings the check while it stops" in stop and "a ping resumes a paused check" in stop
+    assert "Before you stop titan2 before 15:33, pause" not in stop
+    session = laptop_mod.Session()                                     # the line the advice waits for
+    session.request_stop("CTRL_C")
+    assert laptop_mod._ending(runtime.EXIT_OK, session, ROOT) == "titan2 stopped cleanly (CTRL_C)"
+
+
 def _decisions() -> str:
     """RUNBOOK §10's decisions record (the '### Decisions (2026-10-11)' block)."""
     return _section(_read(RUNBOOK), "Decisions (2026-10-11)")

@@ -31,6 +31,13 @@ What handle() does
   (_eod_waits), so the Exit never comes first.
 - pub/ files are written at the start of the next handle() (after the previous transaction committed), so pub/
   never shows a rolled-back row; a failed write is a WARN, never a halt.
+- Measurement and visibility (2026-10-14 night; information only, no decision reads any of it): every broker read's
+  round trip (the engine's send to its answer, per account and kind) and the quote lane's measured calls
+  (EngineContext.take_quote_calls) go into one DEBUG LATENCY event a minute, with the heartbeat, for the daily
+  report's latency table; the first bars' pre-open volume (BarsClosed.preopen) into a DEBUG PREOPEN_VOLUME event,
+  which the 15:36 bar check copies into bar_checks.detail. A new SESSION_IMPAIRED mark is also one WARN alert per
+  event (it was an event only), and on the laptop (no LIVE order leaves it) the LIVE account's read warnings say
+  "Kite account check (no LIVE trading here)".
 
 Contract with the gateway and the exit loop (U13; their side is GatewayPort / ExitLoopPort in core/state.py).
 They run inside the engine's transaction and may use, on the Engine `eng` they are handed:
@@ -92,8 +99,8 @@ from titan2.model import (
     parse_tag,
 )
 from titan2.settings import (
-    FRESH_FILL_GRACE_S, G1_IMPAIRED_GAP_S, HEARTBEAT_EVERY_S, POST_EXIT_TAIL_MIN, QUOTE_REQUEST_TIMEOUT_S,
-    RECON_CONFIRM_GAP_S,
+    FRESH_FILL_GRACE_S, G1_IMPAIRED_GAP_S, G1_MAX_IMPAIRED_FRAC, HEARTBEAT_EVERY_S, POST_EXIT_TAIL_MIN,
+    QUOTE_REQUEST_TIMEOUT_S, RECON_CONFIRM_GAP_S,
 )
 from titan2.store import core_only
 
@@ -157,6 +164,11 @@ QUOTE_REQUEST_STALE_S = QUOTE_REQUEST_TIMEOUT_S + 2.0
 # unanswered after this long was lost: it stops counting as in flight, else request_positions/request_orders would
 # dedupe for the rest of the day and the exit cap and verify-flat would lose their EXIT-priority reads.
 READ_LOST_S = 15.0
+# The laptop sends no LIVE order (EngineContext.live_orders False): its LIVE reads only check the Kite account it
+#   shares with EC2, so their warnings say so instead of reading like real-money trouble (2026-10-14 night)
+KITE_CHECK_WORDS = "Kite account check (no LIVE trading here)"
+KITE_CHECK_CODES = frozenset({"READ_LOST", "STALE_RECON"})
+IMPAIRED_ALERT_LINES = 5                              # one SESSION_IMPAIRED alert lists at most this many groups
 EXIT_CONTROLLED_RESTART = 75
 VCN_SAMPLE_MAX = 50
 VCN_TOLERANCE_RS = 1.0
@@ -232,6 +244,11 @@ class Engine:
         self._pub_fails: dict[str, int] = {}       # consecutive failures per pub/ file
         self._selftest_proof: _SelfTestProof | None = None
         self._late_blocked: set[str] = set()       # NOT_PLACED orders whose late fill could not be imported (alerted)
+        # information only (the LATENCY event, _flush_latency): broker read round trips in ms, "<ACCOUNT>:<KIND>" ->
+        #   [ms, ...], and the failed ones' count, since the last flush. RAM: a reload loses at most a minute of them
+        self._read_ms: dict[str, list[int]] = {}
+        self._read_failed: dict[str, int] = {}
+        self._impaired_new: list[tuple[date, str, str]] = []   # SESSION_IMPAIRED marks of this event, for its alert
 
     # ------------------------------------------------------------------------------------------------------------
     # Loading and the entry points the runtime calls
@@ -267,7 +284,7 @@ class Engine:
             self._started = True
             out += self._startup()
         out += self._dispatch(ev)
-        return self._track(out)
+        return self._track(out + self._impaired_alert())
 
     def check_invariants(self) -> None:
         invariants.check(self)
@@ -294,7 +311,7 @@ class Engine:
             kind, _, value = scope.partition(":")
             halt_scope = scope if kind == "ACCOUNT" and value in {a.value for a in Account} else "GLOBAL"
             out += self.add_halt("INVARIANT", halt_scope, text)
-        return self._track(out)
+        return self._track(out + self._impaired_alert())
 
     @core_only
     def raise_halt(self, kind: str, scope: str, clears: HaltClears | str, reason: str, *,
@@ -307,7 +324,7 @@ class Engine:
             if kind == "EXCEPTION":
                 self.event("EXCEPTION", {"reason": reason[:500]}, "CRITICAL")
         out += self.add_halt(kind, scope, reason, clears=HaltClears(clears), operator=operator)
-        return self._track(out)
+        return self._track(out + self._impaired_alert())
 
     @property
     def recovery_done(self) -> bool:
@@ -413,6 +430,14 @@ class Engine:
         if isinstance(ev, BarsClosed):
             for b in ev.bars:
                 self.store.put_bar(b)
+            if ev.preopen:                   # the first bars' pre-open volume, for the 15:36 bar check's detail
+                try:
+                    vols = {str(s): v for s, v in ev.preopen if isinstance(v, int) and not isinstance(v, bool)}
+                except (TypeError, ValueError):
+                    log.exception("pre-open volumes not recorded: %r", ev.preopen)
+                    vols = {}
+                if vols:
+                    self.event("PREOPEN_VOLUME", {"volumes": vols}, "DEBUG")
             return []
         if isinstance(ev, FeedState):
             return self._on_feed_state(ev)
@@ -518,12 +543,37 @@ class Engine:
         self._flag_session(self.session, strategy, detail)
 
     def _flag_session(self, day: date, strategy: str, detail: str) -> None:
-        """Mark one of the strategy's sessions IMPAIRED for G1 (§10.7); idempotent (the first detail is kept)."""
+        """Mark one of the strategy's sessions IMPAIRED for G1 (§10.7); idempotent (the first detail is kept). A new
+        mark also reaches the phone: this event's marks make one WARN SESSION_IMPAIRED (_impaired_alert)."""
         if self.store.flag_session(day, strategy, detail[:300]):
             payload = {"strategy": strategy, "detail": detail[:300]}
             if day != self.session:
                 payload["session"] = day.isoformat()
             self.event("SESSION_IMPAIRED", payload, "WARN", strategy=strategy)
+            self._impaired_new.append((day, strategy, detail[:300]))
+
+    def _impaired_alert(self) -> list[Command]:
+        """The SESSION_IMPAIRED marks this event made, as one WARN alert (2026-10-14 night: they were events only, so
+        10-13's marks after its 10:03 start never reached the phone). Marks that share a session and a reason are one
+        line; a start after days off marks each missed session, and a long list ends with how many more."""
+        new, self._impaired_new = self._impaired_new, []
+        if not new:
+            return []
+        groups: dict[tuple[date, str], set[str]] = {}
+        for day, strategy, detail in new:
+            groups.setdefault((day, detail), set()).add(strategy)
+        days = sorted({day for day, _ in groups})
+        lines = [f"{day.isoformat()} for {', '.join(sorted(names))}: {detail}"
+                 for (day, detail), names in sorted(groups.items())]
+        shown = "; ".join(lines[:IMPAIRED_ALERT_LINES])
+        if len(lines) > IMPAIRED_ALERT_LINES:
+            shown += f"; and {len(lines) - IMPAIRED_ALERT_LINES} more (titan2 g1 lists them)"
+        what = f"session {days[0].isoformat()}" if len(days) == 1 else f"{len(days)} sessions"
+        text = (f"G1 marked {what} disturbed (IMPAIRED): {shown}. Its trades still count, but a strategy whose "
+                f"IMPAIRED days pass {G1_MAX_IMPAIRED_FRAC:.0%} of the days it traded cannot pass G1")
+        names = ",".join(sorted({s for _, s, _ in new}))
+        key = f"session_impaired:{days[0].isoformat()}:{days[-1].isoformat()}:{names}"
+        return [Alert("WARN", "SESSION_IMPAIRED", text[:900], key)]
 
     def reload_modes(self) -> None:
         self.state.modes = {r["strategy"]: r for r in self.store.strategy_modes()}
@@ -1363,9 +1413,80 @@ class Engine:
             for kind, n in lost:
                 self.event("READ_LOST", {"account": str(acct), "kind": kind, "lost": n, "after_s": READ_LOST_S},
                            "WARN", account=acct)
-                out.append(Alert("WARN", "READ_LOST", f"{acct}: {n} {kind} read(s) unanswered for "
-                                 f"{READ_LOST_S:.0f} s; asking again", f"read_lost:{acct}:{kind}"))
+                out.append(Alert("WARN", "READ_LOST", f"{self._account_words(acct)}: {n} {kind} read(s) unanswered "
+                                 f"for {READ_LOST_S:.0f} s; asking again", f"read_lost:{acct}:{kind}"))
         return out
+
+    def _account_words(self, acct: Account | str) -> str:
+        """How an alert names an account: the account, or on the laptop (no LIVE order leaves it) the LIVE account
+        as KITE_CHECK_WORDS, since its reads there only check the Kite account (2026-10-14 night)."""
+        return KITE_CHECK_WORDS if Account(acct) is Account.LIVE and not self.ctx.live_orders else str(acct)
+
+    def _kite_check_wording(self, alerts: Iterable[Alert], acct: Account | str) -> list[Command]:
+        """recon's and recovery's account-read warnings (KITE_CHECK_CODES) worded as _account_words says."""
+        out: list[Command] = []
+        prefix = f"{acct}: "
+        for a in alerts:
+            words = self._account_words(acct)
+            if a.code in KITE_CHECK_CODES and words != str(acct) and a.text.startswith(prefix):
+                a = dataclasses.replace(a, text=f"{words}: {a.text[len(prefix):]}")
+            out.append(a)
+        return out
+
+    def _note_read(self, acct: Account, kind: str, sent: float | None, ok: bool) -> None:
+        """A broker read was answered: its round trip, the engine's send of the oldest one in flight to now, for the
+        next LATENCY event (information only: the daily report's latency table)."""
+        if sent is None:
+            return
+        key = f"{acct}:{kind}"
+        self._read_ms.setdefault(key, []).append(int(round(max(0.0, self.now_mono - sent) * 1000.0)))
+        if not ok:
+            self._read_failed[key] = self._read_failed.get(key, 0) + 1
+
+    def _flush_latency(self) -> None:
+        """One DEBUG LATENCY event with what was measured since the last one (with the 60 s heartbeat, and before
+        the daily report): the quote lane's calls (EngineContext.take_quote_calls: at, ms, kite_ms, n, idle_s,
+        retried, outcome, kind) and the broker reads' round trips per account and kind, in ms. Information only:
+        nothing decides on it, and a broken source is logged, never a halt."""
+        try:
+            calls = list(self.ctx.take_quote_calls() or ())
+        except Exception:
+            log.exception("the quote lane's measured calls could not be taken")
+            calls = []
+        reads, failed = self._read_ms, self._read_failed
+        self._read_ms, self._read_failed = {}, {}
+        if not (calls or reads or failed):
+            return
+        payload: dict[str, Any] = {}
+        docs = [d for d in (self._quote_call_doc(c) for c in calls) if d is not None]
+        if docs:
+            payload["quote_calls"] = docs
+        if reads:
+            payload["reads"] = reads
+        if failed:
+            payload["read_failures"] = failed
+        if payload:
+            self.event("LATENCY", payload, "DEBUG")
+
+    def _quote_call_doc(self, c: Any) -> dict[str, Any] | None:
+        """One measured quote call (a lanes.QuoteCall) as LATENCY stores it, its mono time turned into a wall time;
+        only plain numbers, so the row is always valid JSON. None (logged) for a record that is not one."""
+        def ms(x: Any) -> int | None:
+            n = _num(x)
+            return None if n is None else int(round(n))
+
+        try:
+            mono, idle = _num(c.mono), _num(getattr(c, "idle_s", None))
+            at = self.now_wall - timedelta(seconds=max(0.0, self.now_mono - mono)) if mono is not None else None
+            retried = getattr(c, "retried", None)
+            return {"at": at.strftime("%H:%M:%S.%f")[:-3] if at is not None else None, "ms": ms(c.ms),
+                    "kite_ms": ms(getattr(c, "kite_ms", None)), "n": int(getattr(c, "symbols", 0)),
+                    "idle_s": None if idle is None else round(idle, 1),
+                    "retried": retried if isinstance(retried, bool) else None,
+                    "outcome": str(getattr(c, "outcome", "?"))[:80], "kind": str(getattr(c, "kind", "QUOTE"))[:10]}
+        except Exception:
+            log.exception("a measured quote call could not be recorded: %r", c)
+            return None
 
     def _on_intent(self, intent: Intent) -> list[Command]:
         if self.state.stopping:
@@ -1435,6 +1556,7 @@ class Engine:
     def _on_positions(self, ev: PositionsSnapshot) -> list[Command]:
         acct = Account(ev.account)
         bv = self.state.broker[acct]
+        self._note_read(acct, "POSITIONS", bv.pos_sent[0] if bv.pos_sent else None, ev.ok)
         del bv.pos_sent[:1]                                  # the oldest read in flight is answered
         bv.pos_pending = len(bv.pos_sent)
         self._audit(acct, "POSITIONS", ev.ok, lambda: list(ev.rows) if ev.ok else {"error": ev.error})
@@ -1456,6 +1578,7 @@ class Engine:
     def _on_orders(self, ev: OrdersSnapshot) -> list[Command]:
         acct = Account(ev.account)
         bv = self.state.broker[acct]
+        self._note_read(acct, "ORDERS", bv.ords_sent[0] if bv.ords_sent else None, ev.ok)
         del bv.ords_sent[:1]
         bv.ords_pending = len(bv.ords_sent)
         self._audit(acct, "ORDERS", ev.ok, lambda: list(ev.orders) if ev.ok else {"error": ev.error})
@@ -1540,7 +1663,7 @@ class Engine:
     def _apply_recon(self, acct: Account, res: recon.ReconResult) -> list[Command]:
         bv = self.state.broker[acct]
         bv.recon = res.memory
-        out: list[Command] = list(res.alerts) + list(res.commands)
+        out: list[Command] = self._kite_check_wording(res.alerts, acct) + list(res.commands)
         for e in res.events:
             self.event(e.kind, dict(e.payload), e.severity, account=acct)
         for h in res.halts:
@@ -1656,6 +1779,7 @@ class Engine:
     def _on_margins(self, ev: MarginsResult) -> list[Command]:
         acct = Account(ev.account)
         bv = self.state.broker[acct]
+        self._note_read(acct, "MARGINS", bv.margins_sent, ev.ok)
         bv.margins_pending, bv.margins_sent = False, None
         bv.margins = ev
         self._audit(acct, "MARGINS", ev.ok,
@@ -1773,7 +1897,7 @@ class Engine:
 
     def _apply_plan(self, plan: recon.RecoveryPlan) -> list[Command]:
         acct = plan.account
-        out: list[Command] = list(plan.alerts) + list(plan.commands)
+        out: list[Command] = self._kite_check_wording(plan.alerts, acct) + list(plan.commands)
         for e in plan.events:
             self.event(e.kind, dict(e.payload), e.severity, account=acct)
         for h in plan.halts:
@@ -2247,7 +2371,8 @@ class Engine:
         """HEARTBEAT every 60 s. §10.7: a heartbeat gap covering more than G1_IMPAIRED_GAP_S of a session's entry
         window [ENTRY_START, NO_NEW_AFTER) marks that session IMPAIRED for the G1 strategies: every session the gap
         spans, one the bot never ran in included (a bot left stopped on a day expected to be bad must not drop out
-        of G1's sample unseen). So does an ACK halt that keeps a G1 strategy's PAPER book from entering that long."""
+        of G1's sample unseen). So does an ACK halt that keeps a G1 strategy's PAPER book from entering that long.
+        The minute's measurements follow it (_flush_latency: one DEBUG LATENCY event)."""
         st = self.state
         if st.last_heartbeat_mono is not None and self.now_mono - st.last_heartbeat_mono < HEARTBEAT_EVERY_S:
             return
@@ -2257,6 +2382,7 @@ class Engine:
         self._impaired_ack_halts()
         st.last_heartbeat_mono, st.last_heartbeat_wall = self.now_mono, self.now_wall
         self.event("HEARTBEAT", {"phase": self.phase}, "DEBUG")
+        self._flush_latency()
 
     def _entry_window_s(self, session: date, start: datetime, end: datetime) -> float:
         """Seconds of the session's entry window [ENTRY_START, NO_NEW_AFTER) inside [start, end]."""
@@ -2677,14 +2803,25 @@ class Engine:
         start = bounds[0]
         live = find_bar(self.store.bars(sym, source="LIVE", start_from=start, start_to=start), start)
         hist = find_bar(ev.bars, start) if ev.ok else None
-        bc = check_bar(live, hist)
+        bc = check_bar(live, hist, preopen_volume=self._preopen_volume(sym))
         self.store.put_bar_check(self.session, sym, start, bc.ok, bc.detail())
         self.event("BAR_CHECK", {"symbol": sym, "ok": bc.ok, "reasons": list(bc.reasons)}, "INFO" if bc.ok else "WARN")
         return []
 
+    def _preopen_volume(self, symbol: str) -> int | None:
+        """The symbol's pre-open volume today, from the PREOPEN_VOLUME events (the first run that saw it wins), or
+        None (the bot did not watch the pre-open). Information only: the bar check's detail."""
+        for e in self.store.events(session=self.session, kind="PREOPEN_VOLUME"):
+            vols = (e.get("payload") or {}).get("volumes")
+            v = vols.get(symbol) if isinstance(vols, dict) else None
+            if isinstance(v, int) and not isinstance(v, bool):
+                return v
+        return None
+
     def _eod_eod_tasks(self) -> list[Command]:
         """15:38: nightly G1, live review, weekly prune; exports, the daily report and trades_90d are written once
-        this transaction committed (next handle())."""
+        this transaction committed (next handle()). The last minute's measurements go out first, for the report."""
+        self._flush_latency()
         out: list[Command] = []
         run = g1.run_nightly(self.store, self.now_wall, self.now_mono)
         out += list(run.alerts)
@@ -2804,15 +2941,29 @@ class Engine:
             ledger.publish_trade_detail(self.store, pub, int(t["structure_id"]), self.now_wall)
 
     def _publish_events(self) -> None:
+        """pub/events_tail.json without the DEBUG rows (the minute's HEARTBEAT and LATENCY): at the 10-14 close 227
+        of the last 500 events were heartbeats, and the morning had already dropped out (2026-10-14 night)."""
         self._events_seq = ledger.publish_events_tail(self.store, self.ctx.pub_dir, self.now_wall,
-                                                      last_seq=self._events_seq)
+                                                      last_seq=self._events_seq, debug=False)
 
     def _daily_report(self, out: list[Command]) -> None:
-        """The Telegram report first (a retry after a failed file write repeats it inside the 5 min dedup)."""
-        report = ledger.daily_report(self.store, self.session, self.now_wall)
+        """The Telegram report first (a retry after a failed file write repeats it inside the 5 min dedup). Its phone
+        text also carries the saved what-if totals (reports/), the alerter's counts and the runtime's notes (the
+        laptop's condor): display only, so a source that fails leaves its line out."""
+        report = ledger.daily_report(self.store, self.session, self.now_wall, reports_dir=self.ctx.reports_dir,
+                                     alerts=self._outside("alert_counts"), notes=self._outside("report_notes"))
         out.append(Alert("INFO", "DAILY_REPORT", report.telegram, f"daily_report:{self.session}"))
         if self.ctx.reports_dir is not None:
             ledger.write_daily_report(report, self.ctx.reports_dir)
+
+    def _outside(self, name: str) -> dict[str, Any] | None:
+        """EngineContext.<name>() as a dict, or None when it fails (display only: never a reason to lose the
+        report)."""
+        try:
+            return dict(getattr(self.ctx, name)() or {})
+        except Exception:
+            log.exception("the daily report's %s could not be read", name)
+            return None
 
     def _status_books(self) -> list[str]:
         books = {x.book for x in self.state.structures.values() if risk.parse_book(x.book) is not None}

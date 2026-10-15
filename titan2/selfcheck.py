@@ -20,7 +20,11 @@ Fail closed: a row that cannot verify its condition (a tool missing, a read fail
 The laptop phase (the Windows laptop profile, PAPER only: `titan2 laptop`, `titan2 laptop check`) runs LAPTOP_CHECKS
 instead of the matrix: Python and its packages, the env file, the token, the clock against internet time (entries
 stop beyond 1 s, the reading's own error counted), the calendar, the instruments dump, disk, the DB, settings, AC
-power (WARN only) and LIVE off. They replace the systemd,
+power (WARN only), four laptop settings that can end a session (WARN only, no alert of their own, SKIP when
+unreadable: `lid`, closing the lid sleeps the laptop; `restart_pending`, Windows Update waits for a restart;
+`update_hours`, its active hours leave part of 08:00-16:00 open to a restart; `wifi`, more than one saved network
+connects automatically), the phone alerts and dead-man setup (`notify`, WARN only, no test message: the bot's start
+card proves delivery) and LIVE off. They replace the systemd,
 users, v1 and egress-IP rows. Every laptop FAIL is an entry halt (Report.halts()), never an exit, so Report.fatal is
 always False there. Its env file and var dir default to the laptop profile's (TITAN2_ENV_FILE, else
 %APPDATA%\\titan2\\titan2.env; TITAN2_VAR, else %LOCALAPPDATA%\\titan2\\var; the Linux paths elsewhere).
@@ -94,6 +98,7 @@ MIN_PYTHON = (3, 10)
 LAPTOP_ENV_KEYS = ("ZERODHA_API_KEY", "ZERODHA_API_SECRET", "ZERODHA_USER_ID")   # the bot and the manual token flow
 LOGIN_ENV_KEYS = ("ZERODHA_PASSWORD", "ZERODHA_TOTP_SECRET")                     # the auto TOTP login
 TELEGRAM_ENV_KEYS = ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID")
+NTFY_ENV_KEY = "NTFY_TOPIC"                                                       # the laptop's phone alerts (ntfy)
 # The laptop clock row: entries stop (HALT CLOCK_UNSYNCED) when this clock can be more than this far off internet
 # time, the reading's own error counted (EC2's ntp row asks chrony through timedatectl instead).
 MAX_CLOCK_OFFSET_S = 1.0
@@ -862,6 +867,10 @@ def _check_prev_session(ctx: Context) -> tuple:
 
 
 def _check_notify(ctx: Context) -> tuple:
+    """Phone alerts and the external dead-man. The server phases send a test message and ping healthchecks /log;
+    the laptop phase only reads the setup (_notify_setup)."""
+    if ctx.phase == LAPTOP:
+        return _notify_setup(ctx)
     problems = []
     tg = ctx.telegram()
     if tg is None:
@@ -880,6 +889,38 @@ def _check_notify(ctx: Context) -> tuple:
         except alerts.AlertError as exc:
             problems.append(str(exc))
     return (not problems), "; ".join(problems) or "Telegram test sent; healthchecks reachable"
+
+
+def _notify_setup(ctx: Context) -> tuple:
+    """The laptop's `notify` row (WARN only, no alert of its own): a message channel (ntfy or Telegram) and the
+    healthchecks.io dead-man (HEALTHCHECK_URL), read from the env, never a value shown. No test message is sent:
+    the bot's START_CARD, sent every morning once its signals run, proves delivery (one phone message, not two).
+    Without HEALTHCHECK_URL nothing outside the laptop notices titan2 stopping: the phone stays as silent as on a
+    quiet day."""
+    problems, channels = [], []
+    for name, transport in (("ntfy", alerts.Ntfy), ("Telegram", alerts.Telegram)):
+        try:
+            if transport.from_env(ctx.env) is not None:
+                channels.append(name)
+        except ValueError as exc:
+            problems.append(f"{name} is set up wrong, so it is off ({exc})")
+    if not channels:
+        problems.append("no phone alerts: set NTFY_TOPIC (docs/LAPTOP.md section 2), or TELEGRAM_BOT_TOKEN and "
+                        "TELEGRAM_CHAT_ID; alerts go to the log only")
+    try:
+        deadman = alerts.Healthcheck.from_env(ctx.env) is not None
+    except ValueError as exc:
+        deadman = False
+        problems.append(f"{exc}: no external dead-man")
+    else:
+        if not deadman:
+            problems.append("HEALTHCHECK_URL is not set (no external dead-man: if titan2 or the laptop stops, nothing "
+                            "rings; docs/LAPTOP.md section 2)")
+    head = f"phone alerts by {' and '.join(channels)}" if channels else ""
+    if problems:
+        return False, "; ".join(([head] if head else []) + problems)
+    return True, (f"{head}; HEALTHCHECK_URL set (the dead-man check rings when titan2 stops pinging); no test "
+                  "message: the start card proves delivery")
 
 
 # -- the laptop phase's own rows ----------------------------------------------------------------------------------
@@ -920,8 +961,9 @@ def _check_env_file(ctx: Context) -> tuple:
     notes = []
     if not all(k in have for k in LOGIN_ENV_KEYS):
         notes.append(f"without {' and '.join(LOGIN_ENV_KEYS)} the token step uses the manual request-token flow")
-    if not all(k in have for k in TELEGRAM_ENV_KEYS):
-        notes.append(f"no Telegram alerts without {' and '.join(TELEGRAM_ENV_KEYS)}")
+    if not all(k in have for k in TELEGRAM_ENV_KEYS) and NTFY_ENV_KEY not in have:     # ntfy alone carries them
+        notes.append(f"no phone alerts: set {NTFY_ENV_KEY} for ntfy (no Telegram alerts without "
+                     f"{' and '.join(TELEGRAM_ENV_KEYS)} either)")
     ignored = sorted(k for k in have if k in FORBIDDEN_BOT_ENV)
     if ignored:
         notes.append(f"{', '.join(ignored)} ignored (the token lives in the session file, modes in the DB)")
@@ -1023,6 +1065,82 @@ def _check_network(ctx: Context) -> tuple:
                    "router or use another network (a phone hotspot) before 09:15")
 
 
+# -- laptop settings that can end a session (2026-10-14 night: the lid was set to Sleep, a Windows restart was
+#    pending, update hours began at 09:00, 8 of 9 Wi-Fi networks auto-connected, and the self-check said 12/12 PASS).
+#    WARN only, no alert of their own (the start card lists a WARN); a setting that cannot be read SKIPs.
+SESSION_HOURS = (8, 16)                          # update_hours: titan2's day, 08:00-16:00 (08:40 start, 15:45 stop)
+
+
+def _check_lid(ctx: Context) -> tuple:
+    from titan2 import laptop
+
+    got = laptop.lid_close_action()
+    if got is None:
+        return None, "what closing the lid does is unknown (powercfg could not be read)"
+    ac, dc = got
+    name = getattr(laptop, "LID_ACTIONS", {})            # powercfg's index: 0 do nothing, 1 sleep, ...
+    detail = (f"closing the lid while plugged in: {name.get(ac, f'action {ac}')}; on battery: "
+              f"{name.get(dc, f'action {dc}')}")
+    if ac == 0:
+        return True, detail
+    return False, (f"{detail}. A closed lid sleeps the laptop, and titan2 stops managing its positions: set 'When "
+                   "plugged in: Do nothing' (Control Panel > Power Options > Choose what closing the lid does), or "
+                   "run powercfg /setacvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0 then powercfg /setactive "
+                   "SCHEME_CURRENT; or keep the lid open in market hours")
+
+
+def _check_restart_pending(ctx: Context) -> tuple:
+    from titan2 import laptop
+
+    pending = laptop.restart_pending()
+    if pending is None:
+        return None, "whether Windows waits for a restart is unknown (the registry could not be read)"
+    if not pending:
+        return True, "no Windows restart pending"
+    return False, ("Windows Update waits for a restart: outside its active hours it may restart the laptop by itself. "
+                   "Restart it yourself after the session (never during one)")
+
+
+def _hours_cover(start: int, end: int, hour: int) -> bool:
+    """Whether active hours [start, end) on the 24-hour clock (end before start: past midnight) cover `hour`."""
+    if start == end:
+        return False
+    return start <= hour < end if start < end else hour >= start or hour < end
+
+
+def _check_update_hours(ctx: Context) -> tuple:
+    from titan2 import laptop
+
+    hours = laptop.update_active_hours()
+    if hours is None:
+        return None, "Windows Update's active hours are unknown (not set, or the registry could not be read)"
+    start, end = hours
+    lo, hi = SESSION_HOURS
+    span = f"{start:02d}:00-{end:02d}:00"
+    if all(_hours_cover(start, end, h) for h in range(lo, hi)):
+        return True, f"Windows Update's active hours {span} cover {lo:02d}:00-{hi:02d}:00"
+    return False, (f"Windows Update's active hours are {span}: outside them Windows may restart the laptop to install "
+                   f"updates, and titan2 needs it from {lo:02d}:00 to {hi:02d}:00 (it starts from 08:40 and stops "
+                   "about 15:45). Set them to 07:00-01:00 (Settings > Windows Update > Advanced options > Active "
+                   "hours)")
+
+
+def _check_wifi(ctx: Context) -> tuple:
+    from titan2 import laptop
+
+    got = laptop.wifi_auto_connect()
+    if got is None:
+        return None, "the saved Wi-Fi networks could not be listed (no Wi-Fi, or netsh in another language)"
+    auto, total = got
+    detail = (f"{len(auto)} of {total} saved Wi-Fi network{'' if total == 1 else 's'} "
+              f"connect{'s' if len(auto) == 1 else ''} automatically")
+    if len(auto) <= 1:
+        return True, detail + (f" ({auto[0]})" if auto else "")
+    return False, (f"{detail}: Windows can switch between them mid-session and drop the Kite feed (on 10-13 "
+                   "a switch dropped it for 3 s). Untick 'Connect automatically' on all but the one you trade on "
+                   "(Settings > Network & internet > Wi-Fi > Manage known networks)")
+
+
 def _check_live_off(ctx: Context) -> tuple:
     from titan2 import laptop
 
@@ -1079,8 +1197,8 @@ CHECKS: tuple[Check, ...] = (
           Effect(WARN, "WARN", alert=_A.WARN), _check_rates),
     Check("prev_session", "previous session closed clean (flat, EOD done)", _ph(MORNING, PRESTART),
           Effect(FAIL, "CRITICAL", alert=_A.CRITICAL), _check_prev_session),
-    Check("notify", "Telegram test and healthchecks ping", _ph(MORNING, CUTOVER),
-          Effect(WARN, "WARN", alert=_A.WARN), _check_notify),
+    Check("notify", "phone alerts and the healthchecks dead-man (morning and cutover: a test message and a ping)",
+          _ph(MORNING, CUTOVER), Effect(WARN, "WARN", alert=_A.WARN), _check_notify),
 )
 
 
@@ -1095,6 +1213,7 @@ def _laptop_row(name: str, **changes: Any) -> Check:
 # A laptop FAIL halts entries and never exits: the host rows and the (elsewhere exit-78) DB row raise HALT(INVARIANT),
 # which an operator clears with `titan2 ack-halt` once fixed.
 _UNFIT = Effect(FAIL, "HALT(INVARIANT)", _halt("INVARIANT", clears=HaltClears.ACK), _A.CRITICAL)
+_CARD_WARN = Effect(WARN, "WARN (the start card lists it; no alert of its own)")
 LAPTOP_CHECKS: tuple[Check, ...] = (
     Check("python", "Python >= 3.10; kiteconnect, pyotp, requests and flask importable", _LAPTOP, _UNFIT,
           _check_python),
@@ -1112,6 +1231,15 @@ LAPTOP_CHECKS: tuple[Check, ...] = (
     _laptop_row("db", effect=_UNFIT),
     _laptop_row("settings"),
     Check("power", "on AC power (WARN only)", _LAPTOP, Effect(WARN, "WARN", alert=_A.WARN), _check_power),
+    # settings that can end a session (2026-10-14 night): WARN, and the start card lists them (no alert of their own)
+    Check("lid", "closing the lid does nothing while plugged in (WARN only)", _LAPTOP, _CARD_WARN, _check_lid),
+    Check("restart_pending", "no Windows restart pending (WARN only)", _LAPTOP, _CARD_WARN, _check_restart_pending),
+    Check("update_hours", "Windows Update's active hours cover 08:00-16:00 (WARN only)", _LAPTOP, _CARD_WARN,
+          _check_update_hours),
+    Check("wifi", "at most one saved Wi-Fi network connects automatically (WARN only)", _LAPTOP, _CARD_WARN,
+          _check_wifi),
+    # the setup only, no test message: the bot's START_CARD lists a WARN here and proves delivery (no alert of its own)
+    _laptop_row("notify", effect=Effect(WARN, "WARN (the start card lists it; no alert of its own)")),
     Check("live_disabled", "LIVE disabled: the laptop profile is PAPER only", _LAPTOP,
           Effect(FAIL, "LIVE_DISABLED_TODAY", _halt("LIVE_DISABLED_TODAY", "ACCOUNT:LIVE", HaltClears.NEXT_SESSION),
                  _A.CRITICAL), _check_live_off),

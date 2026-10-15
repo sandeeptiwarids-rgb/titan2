@@ -7,7 +7,12 @@ Bars (signals thread only; not thread-safe)
   [open, close) build no bar but still update the symbol's volume baseline.
 - The session's first bar (the 09:15 bar, opening_drive's input): open = the exchange day open (tick ohlc.open),
   high/low = LTP extremes including that open, close = the last LTP before 09:20:00, volume = the cumulative
-  volume_traded at that tick (pre-open volume included, like Kite's 09:15 candle [V by the bar check]).
+  volume_traded at that tick, the pre-open auction's volume included. That this matches Kite's 09:15 candle was a
+  [V] note, and the first full bar check failed it (2026-10-14): none of 23 first bars matched Kite's volume within
+  0.1% and 10 were more than 5% off, while open and close matched exactly and later bars match; most likely Kite's
+  candle leaves the pre-open auction out. The 15:36 check therefore stores both volumes, signed, and the pre-open
+  volume (the cumulative volume at the symbol's last tick before the session opened: take_preopen(), sent with the
+  first bars' BarsClosed) in bar_checks.detail. Information only: the bars themselves are unchanged.
 - Every other bar: open/high/low/close from LTPs; volume = cumulative volume at its last tick minus the cumulative
   volume at the symbol's last tick before the bar.
 - A bar is invalid when the feed was down, or ticks were lost (signal_q overflow), at any moment of its window; when
@@ -130,6 +135,7 @@ class Bars:
         self._down_since: datetime | None = _EPOCH             # feed down until the first connect
         self._gaps: list[tuple[datetime, datetime]] = []       # closed intervals: feed down or ticks lost
         self._prev: dict[str, tuple[Bar, ...]] = {}
+        self._preopen: dict[str, int] = {}                     # first bars closed since the last take_preopen()
         self.late_ticks = 0
 
     @classmethod
@@ -211,6 +217,13 @@ class Bars:
     def why_invalid(self, symbol: str, start: datetime) -> str | None:
         return self._why.get((symbol, to_ist(start)))
 
+    def take_preopen(self) -> tuple[tuple[str, int], ...]:
+        """(symbol, pre-open volume) of the first bars closed since the last call, sorted: the cumulative volume at the
+        symbol's last tick before the session opened (the pre-open auction's), which the first bar's volume includes.
+        Only symbols that had such a tick; the host sends them with the first bars' BarsClosed (bar check detail)."""
+        out, self._preopen = tuple(sorted(self._preopen.items())), {}
+        return out
+
     def set_prev_session(self, symbol: str, bars: Iterable[Bar]) -> None:
         """The previous session's HIST bars for symbol (from FetchHistorical at prep), any order."""
         rows = list(bars)
@@ -251,6 +264,8 @@ class Bars:
             o = acc.day_open if acc.day_open is not None else acc.open
             volume = acc.cum_last
             w0 = acc.start
+            if acc.base_cum is not None:              # the pre-open auction's volume, which `volume` includes
+                self._preopen[acc.symbol] = acc.base_cum
             if acc.day_open is None:
                 why = NO_DAY_OPEN
             elif acc.day_open_changed:
@@ -337,13 +352,29 @@ class BarCheck:
     open_dev: float | None             # |live/hist - 1|
     close_dev: float | None
     volume_dev: float | None
+    # information only (2026-10-14 night): the two volumes as they are, so the gap's sign is kept, and the pre-open
+    #   volume (Bars.take_preopen) the live first bar includes. The check itself still judges volume_dev alone
+    live_volume: int | None = None
+    hist_volume: int | None = None
+    preopen_volume: int | None = None
 
     def detail(self) -> str:
-        """bar_checks.detail: JSON with the reasons and deviations (non-finite values as null)."""
+        """bar_checks.detail: JSON with the reasons and deviations (non-finite values as null), plus the signed
+        volumes: live_volume, kite_volume, volume_gap (live - Kite), volume_rel (live/Kite - 1, signed),
+        preopen_volume and volume_rel_ex_preopen ((live - pre-open)/Kite - 1: near 0 if Kite's candle leaves the
+        pre-open auction out)."""
         def num(x: float | None) -> float | None:
             return round(x, 6) if x is not None and math.isfinite(x) else None
+        live, kite, pre = self.live_volume, self.hist_volume, self.preopen_volume
+        both = live is not None and kite is not None
         return json.dumps({"reasons": list(self.reasons), "open_dev": num(self.open_dev),
-                           "close_dev": num(self.close_dev), "volume_dev": num(self.volume_dev)}, sort_keys=True)
+                           "close_dev": num(self.close_dev), "volume_dev": num(self.volume_dev),
+                           "live_volume": live, "kite_volume": kite, "preopen_volume": pre,
+                           "volume_gap": live - kite if both else None,
+                           "volume_rel": num(live / kite - 1.0) if both and kite > 0 else None,
+                           "volume_rel_ex_preopen": (num((live - pre) / kite - 1.0)
+                                                     if both and kite > 0 and pre is not None else None)},
+                          sort_keys=True)
 
 
 def _rel_dev(live: float, hist: float) -> float | None:
@@ -352,11 +383,16 @@ def _rel_dev(live: float, hist: float) -> float | None:
     return abs(live / hist - 1.0)
 
 
-def check_bar(live: Bar | None, hist: Bar | None) -> BarCheck:
-    """Compare a live first bar with Kite's historical candle: open and close within 0.1 %, volume within 5 %."""
+def check_bar(live: Bar | None, hist: Bar | None, preopen_volume: int | None = None) -> BarCheck:
+    """Compare a live first bar with Kite's historical candle: open and close within 0.1 %, volume within 5 %.
+    preopen_volume (the symbol's cumulative volume before the open, when known) is only recorded in the detail."""
     ref = live if live is not None else hist
     symbol = ref.symbol if ref is not None else ""
     start = ref.start if ref is not None else None
+    vols = {"live_volume": live.volume if live is not None else None,
+            "hist_volume": hist.volume if hist is not None else None,
+            "preopen_volume": preopen_volume if isinstance(preopen_volume, int) and not isinstance(preopen_volume, bool)
+            else None}
     reasons = []
     if live is None:
         reasons.append("LIVE_MISSING")
@@ -367,7 +403,7 @@ def check_bar(live: Bar | None, hist: Bar | None) -> BarCheck:
     elif not hist.valid:
         reasons.append("HIST_INVALID")
     if live is None or hist is None:
-        return BarCheck(symbol, start, False, tuple(reasons), None, None, None)
+        return BarCheck(symbol, start, False, tuple(reasons), None, None, None, **vols)
     if live.symbol != hist.symbol or live.start != hist.start:
         reasons.append("NOT_THE_SAME_BAR")
     open_dev, close_dev = _rel_dev(live.open, hist.open), _rel_dev(live.close, hist.close)
@@ -379,7 +415,7 @@ def check_bar(live: Bar | None, hist: Bar | None) -> BarCheck:
                            ("VOLUME", volume_dev, BAR_CHECK_VOLUME_TOL)):
         if dev is None or dev > tol + _TOL_EPS:
             reasons.append(name)
-    return BarCheck(symbol, start, not reasons, tuple(reasons), open_dev, close_dev, volume_dev)
+    return BarCheck(symbol, start, not reasons, tuple(reasons), open_dev, close_dev, volume_dev, **vols)
 
 
 def bar_check_symbols(fired: Iterable[str], universe: Iterable[str], session: date,

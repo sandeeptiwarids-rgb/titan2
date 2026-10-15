@@ -21,6 +21,9 @@ close() and close_external() are the only callers of ledger.build_trade_row (net
 effective fills) and the only writers of `trades`. Each books inside its own terminal transition, in one
 transaction (a savepoint inside the core's), so P&L is booked once (I10: trades PK plus the immutability trigger).
 Quantities are never stored on a leg: open_qty is derived from its orders' broker-confirmed fills (model.Leg).
+
+A placebo's opened and closed alerts begin with PLACEBO_LABEL (2026-10-14 night: on 10-14 the phone showed
+"PLACEBO:price_spike_up ... net Rs -5,299.97" like any trade): it is G1's control trade, not a strategy result.
 """
 
 from __future__ import annotations
@@ -135,10 +138,18 @@ def _pnl_payload(row: Mapping) -> dict:
                                 "entry_avg", "exit_avg", "exit_reason", "n_executed_orders")}
 
 
+PLACEBO_LABEL = "control trade (placebo), not a strategy result"
+
+
+def _labelled(st: Structure, text: str) -> str:
+    """A position alert's text, labelled when the structure is a placebo (G1's control trade)."""
+    return f"{PLACEBO_LABEL}: {text}" if st.is_placebo else text
+
+
 def _closed_alert(st: Structure, row: Mapping) -> Alert:
     text = (f"{st.book} {row['symbol']} closed ({row['exit_reason']}): net Rs {row['net']:,.2f} "
             f"[{row['pnl_status']}]")
-    return Alert("INFO", "POSITION_CLOSED", text, f"closed:{st.structure_id}")
+    return Alert("INFO", "POSITION_CLOSED", _labelled(st, text), f"closed:{st.structure_id}")
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -285,7 +296,7 @@ def on_entry_terminal(store: Store, st: Structure, leg: Leg, *, profile: ExitPro
                {"symbol": leg.inst.symbol, "qty": qty, "entry_avg": round(premium / qty, 4) if qty else None,
                 "risk_basis_rs": st.risk_basis_rs, "exit_params": params, "problems": problems,
                 "partial": qty < sum(o.qty for o in entries)}, "CRITICAL" if problems else "INFO", leg.leg_id)
-    text = f"{st.book} {leg.inst.symbol} opened: {qty} @ {premium / qty:.2f}"
+    text = _labelled(st, f"{st.book} {leg.inst.symbol} opened: {qty} @ {premium / qty:.2f}")
     fx = Effects(commands=[Alert("INFO", "POSITION_OPENED", text, f"opened:{st.structure_id}")])
     selftest = any(o.role is Role.SELFTEST for o in filled)
     if selftest:

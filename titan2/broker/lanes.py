@@ -7,7 +7,12 @@
   through KiteData (no order methods). Quote requests run on their own thread, so a slow account read never
   holds back an EXIT quote refresh. They are batched, up to 500 symbols per call, collected in priority order
   (EXIT first); a quote request that has waited 3 s is answered QuoteResult(ok=False, error="TIMEOUT"). Other
-  reads run in priority order.
+  reads run in priority order. The quote thread also keeps Kite's connection warm (ReadsLane.keep_warm): while
+  active() (the runtime's: 09:00-15:30 on a trading day), one ltp() of NIFTY 50 once no quote call went out for
+  60 s, its answer thrown away. Every call it makes is measured (QuoteCall: how long it took, Kite's own share,
+  the symbols, the seconds since the previous call, a retry, the outcome), logged to the log file only (one INFO
+  "quote call:" line, kept off the laptop's console) and kept for the core, which takes them once a minute
+  (take_quote_calls) into a LATENCY event for the daily report. Nothing decides on them.
 - TokenBucket: shared, thread-safe, blocking pacing that never fails open.
 - execute_broker(): the pure mapping command -> port call -> events. Both lanes, the inline test harness and
   paper-sim can use it, so LIVE and PAPER answer the engine with identical events. req_mono stamps a read with
@@ -47,6 +52,19 @@ from titan2.settings import QUOTE_REQUEST_TIMEOUT_S, REST_BATCH      # code cons
 log = logging.getLogger(__name__)
 
 QUOTES_LANE_THREAD = f"{READS_LANE_THREAD}-quotes"                               # ReadsLane's quote() worker
+# The keep-warm call (ReadsLane.keep_warm). Kite, or a router on the way, drops a connection that has been idle for a
+#   few minutes, and the next quote() then waits for a new one: on 2026-10-13/14 a quote call made after 5+ idle
+#   minutes took a median 0.98 s (33 calls, 16 over 1 s), one on a warm connection 0.11 s (52 calls); 2 in 5 entry
+#   quotes were cold, the 09:20 batch among them (2.0 s late). One call a minute is about 1% of the quote budget.
+KEEP_WARM_IDLE_S = 60.0                  # a throwaway ltp() once no quote call went out for this long ...
+KEEP_WARM_SYMBOLS = ("NSE:NIFTY 50",)    # ... of this symbol; its answer reaches no cache and no decision
+KEEP_WARM_RECHECK_S = 5.0                # while active() says no (or fails), it is asked again this often
+# The measurement of every quote-client call (QuoteCall, 2026-10-14 night: the self-audit had to rebuild every REST
+#   latency by hand from receipt stamps). The core takes them once a minute; past this many untaken the oldest go.
+QUOTE_CALLS_KEPT = 5000
+QUOTE, WARM = "QUOTE", "WARM"            # QuoteCall.kind: a quote() batch, or the keep-warm ltp()
+OFF_CONSOLE = {"titan2_console": False}  # logging extra: the file has the line, the laptop's console does not
+#                                          (laptop.ON_CONSOLE is the attribute's name)
 
 ORDER_COMMANDS = (Place, Cancel, PollOrder, LookupTag, FetchTrades)              # LIVE -> lane-live-orders
 ACCOUNT_READ_COMMANDS = (FetchPositions, FetchOrders, FetchTradebook, FetchMargins)  # LIVE -> lane-reads
@@ -378,6 +396,32 @@ def read_priority(cmd: Command) -> int:
     return int(Priority.BACKGROUND)          # FetchHistorical, Prep, ContractNote
 
 
+@dataclass(frozen=True, slots=True)
+class QuoteCall:
+    """One measured call of the quote client. mono: when it went out. ms: the whole call as the lane saw it, the wait
+    for the 1-a-second token included (what an entry or an exit refresh waited). kite_ms: Kite's own share
+    (KiteData.last_quote; None from a client that does not say). symbols: how many it asked. idle_s: seconds since
+    the previous quote or keep-warm call went out (None: the first of this process); a long one means a cold
+    connection. retried: asked again once after a dropped connection (None: not known). outcome: OK, MISSING <k>
+    (Kite left k symbols out) or the failure's class, e.g. AMBIGUOUS:ConnectionError. kind: QUOTE or WARM."""
+
+    mono: float
+    ms: float
+    kite_ms: float | None
+    symbols: int
+    idle_s: float | None
+    retried: bool | None
+    outcome: str
+    kind: str = QUOTE
+
+
+def failure_kind(error: str | None) -> str:
+    """The class of a failed read's text (format_error: '<OUTCOME>:<name>: <message>') without its message:
+    'AMBIGUOUS:ConnectionError: ...' -> 'AMBIGUOUS:ConnectionError'."""
+    head = ":".join(str(error or "").split(":", 2)[:2]).strip()
+    return head or "FAILED"
+
+
 @dataclass(slots=True, eq=False)
 class _QuoteJob:
     request_id: str
@@ -407,13 +451,15 @@ class ReadsLane:
     data is KiteData (or a stand-in): it must not have order methods. quote_data, if given, is the KiteData the quote
     worker calls (e.g. on a Kite client of its own); else data. quote_sink receives every REST Quote before its
     QuoteResult is posted (the runtime binds it to the QuoteCache). prep maps a Prep kind to a handler returning
-    (ok, detail). reply callables let paper-sim receive its own QuoteResults; the default is post.
+    (ok, detail). reply callables let paper-sim receive its own QuoteResults; the default is post. active, if
+    given, says when the quote worker keeps Kite's connection warm (keep_warm); without it, it never does.
     """
 
     def __init__(self, data, post: Post, quote_sink: Callable[[Quote], None], *,
                  prep: Mapping[str, PrepHandler] | None = None, mono: Callable[[], float] = time.monotonic,
                  quote_timeout_s: float = QUOTE_REQUEST_TIMEOUT_S, max_batch: int = REST_BATCH,
-                 quote_data=None) -> None:
+                 quote_data=None, active: Callable[[], bool] | None = None,
+                 keep_warm_s: float = KEEP_WARM_IDLE_S) -> None:
         for source in (data, quote_data):
             for name in ("place", "cancel", "order_history", "order_trades"):
                 if callable(getattr(source, name, None)):
@@ -422,6 +468,8 @@ class ReadsLane:
             raise ValueError(f"max_batch must be 1..{REST_BATCH}, got {max_batch!r}")
         if not (isinstance(quote_timeout_s, (int, float)) and math.isfinite(quote_timeout_s) and quote_timeout_s > 0):
             raise ValueError(f"quote_timeout_s must be a finite number > 0, got {quote_timeout_s!r}")
+        if not (isinstance(keep_warm_s, (int, float)) and math.isfinite(keep_warm_s) and keep_warm_s > 0):
+            raise ValueError(f"keep_warm_s must be a finite number > 0, got {keep_warm_s!r}")
         self.data = data
         self.quote_data = data if quote_data is None else quote_data
         self._post = post
@@ -437,6 +485,13 @@ class ReadsLane:
         self._stopping = False
         self._thread: threading.Thread | None = None                # lane-reads
         self._quote_thread: threading.Thread | None = None          # lane-reads-quotes
+        self.active = active                                        # keep_warm's hours (None: never)
+        self._keep_warm_s = float(keep_warm_s)
+        self._last_quote_call: float | None = None                  # when the last quote() or keep-warm ltp() went out
+        self._warm_at = mono()                                      # keep_warm's next look (nothing asked yet: now)
+        self.keep_warm_calls = 0
+        self.keep_warm_failures = 0
+        self._quote_calls: deque[QuoteCall] = deque(maxlen=QUOTE_CALLS_KEPT)   # measured, not yet taken by the core
 
     # -- submission (any thread) -------------------------------------------------------------------------------
     def submit(self, cmd: Command, reply: Post | None = None) -> None:
@@ -498,13 +553,115 @@ class ReadsLane:
         return self._deliver(out)
 
     def _step_quotes(self) -> list[Event]:
-        """lane-reads-quotes: answer expired/empty quote requests, then make at most one quote() call."""
+        """lane-reads-quotes: answer expired/empty quote requests, then make at most one quote() call; with none to
+        make, the keep-warm call when it is due."""
         with self._cv:
             out = self._expire(self._mono())
             work = self._take_quotes()
         if work is not None:
             out.extend(self._run_quote_batch(*work))
+        else:
+            self.keep_warm()
         return self._deliver(out)
+
+    def keep_warm(self) -> bool:
+        """lane-reads-quotes, when it has no quote to ask: while active() says so, one ltp() of KEEP_WARM_SYMBOLS on
+        the quote client once no quote call went out for keep_warm_s, so the next real quote (an entry's, an exit
+        refresh's) finds an open connection instead of waiting for a new one (KEEP_WARM_IDLE_S says why). It takes a
+        token of the same quote bucket as every quote() (KiteData.ltp), and its answer is thrown away: it never
+        reaches the quote sink, so no entry or exit decision sees it. Only a failure is logged (it is measured too,
+        as a WARM QuoteCall, for the daily report). Returns whether a call was made."""
+        now = self._mono()
+        with self._cv:
+            if self.active is None or now < self._warm_at:
+                return False
+            self._warm_at = now + KEEP_WARM_RECHECK_S              # whatever happens below: no hot loop
+        try:
+            active = bool(self.active())
+        except Exception:
+            log.exception("quote keep-warm: active() failed; no keep-warm call")
+            return False
+        if not active:
+            return False
+        with self._cv:
+            last = self._last_quote_call
+            if last is not None and now - last < self._keep_warm_s:     # a quote call went out meanwhile
+                self._warm_at = last + self._keep_warm_s
+                return False
+            self._last_quote_call, self._warm_at = now, now + self._keep_warm_s
+        self.keep_warm_calls += 1
+        outcome, went = "OK", self._mono()
+        try:
+            self.quote_data.ltp(list(KEEP_WARM_SYMBOLS))
+        except Exception as exc:
+            self.keep_warm_failures += 1
+            error = read_error_text(exc)
+            outcome = failure_kind(error)
+            log.warning("quote keep-warm call failed (%d so far; the next quote may wait for a new connection): %s",
+                        self.keep_warm_failures, error)
+        self._keep(QuoteCall(went, (self._mono() - went) * 1000.0, None, len(KEEP_WARM_SYMBOLS),
+                             None if last is None else now - last, None, outcome, WARM))
+        return True
+
+    def take_quote_calls(self) -> list[QuoteCall]:
+        """The calls measured since the last take, oldest first (any thread; EngineContext.take_quote_calls: the core
+        writes them into its once-a-minute LATENCY event)."""
+        with self._cv:
+            out = list(self._quote_calls)
+            self._quote_calls.clear()
+        return out
+
+    def _keep(self, call: QuoteCall) -> None:
+        with self._cv:
+            self._quote_calls.append(call)
+
+    def _measured(self, went: float, idle_s: float | None, symbols: int, outcome: str | None,
+                  batch: Iterable[str] = (), quotes: Mapping | None = None) -> QuoteCall | None:
+        """The QuoteCall of the quote() that went out at `went` (now it is over), kept for the core and logged to the
+        file only: one INFO line a call, e.g. 'quote call: 3 symbols in 1984 ms (Kite 1978 ms), 412.3 s after the
+        previous call (cold): OK'. outcome None: Kite answered `quotes` for `batch` (OK, or MISSING <k>). Information
+        only, so it never raises: a quote is never lost to its own measurement."""
+        try:
+            ms = (self._mono() - went) * 1000.0
+            if outcome is None:
+                missing = sum(1 for sym in batch if sym not in (quotes or {}))
+                outcome = f"MISSING {missing}" if missing else "OK"
+            timing = getattr(self.quote_data, "last_quote", None)
+            kite_ms = retried = None
+            if timing is not None and getattr(timing, "tries", 0):
+                kite_ms, retried = float(timing.kite_s) * 1000.0, timing.tries > 1
+            call = QuoteCall(went, ms, kite_ms, symbols, idle_s, retried, outcome)
+            self._keep(call)
+            parts = [f"{symbols} symbol{'' if symbols == 1 else 's'} in {ms:.0f} ms"]
+            if kite_ms is not None:
+                wait = ms - kite_ms
+                parts[0] += (f" (Kite {kite_ms:.0f} ms, {wait:.0f} ms waiting for the 1-a-second token)"
+                             if wait >= 50.0 else f" (Kite {kite_ms:.0f} ms)")
+            if idle_s is None:
+                parts.append("the first of this run")
+            else:
+                parts.append(f"{idle_s:.1f} s after the previous call"
+                             + (" (cold)" if idle_s >= self._keep_warm_s else ""))
+            if retried:
+                parts.append("retried once after a dropped connection")
+            log.info("quote call: %s: %s", ", ".join(parts), outcome, extra=OFF_CONSOLE)
+            return call
+        except Exception:
+            log.exception("quote call measurement failed (the quote itself is unaffected)")
+            return None
+
+    def _warm_due(self) -> bool:
+        """Caller holds the lock: the quote worker has a keep-warm look to make."""
+        return self.active is not None and self._mono() >= self._warm_at
+
+    def _quote_call_out(self) -> tuple[float, float | None]:
+        """A quote() call is going out: the keep-warm call waits keep_warm_s from now. Returns (now, the seconds since
+        the previous quote or keep-warm call went out; None for the first)."""
+        now = self._mono()
+        with self._cv:
+            last = self._last_quote_call
+            self._last_quote_call, self._warm_at = now, now + self._keep_warm_s
+        return now, None if last is None else now - last
 
     def _step_reads(self) -> list[Event]:
         """lane-reads: the most urgent read that is not a quote request."""
@@ -614,15 +771,22 @@ class ReadsLane:
 
     def _run_quote_batch(self, members: list[_QuoteJob], batch: list[str], *,
                          registered: bool = True) -> list[tuple[Post, Event]]:
-        """One quote() call for batch; feed the sink; finish the members that are complete or failed."""
+        """One quote() call for batch, measured (_measured); feed the sink; finish the members that are complete or
+        failed."""
+        went, idle = self._quote_call_out()
+        answered = False
         try:
             quotes = self.quote_data.quote(batch)
+            answered = True
+            self._measured(went, idle, len(batch), None, batch, quotes)
             for sym in batch:
                 q = quotes.get(sym)
                 if q is not None:
                     self._sink(q)
         except Exception as exc:
             error = read_error_text(exc)
+            if not answered:
+                self._measured(went, idle, len(batch), failure_kind(error))
             log.warning("quote call for %d symbols failed: %s", len(batch), error)
             with self._cv:
                 out = [(job.reply, job.result(False, error)) for job in members]
@@ -678,8 +842,8 @@ class ReadsLane:
         self._work(self._step_reads, lambda: self._rjobs, "reads")
 
     def run_quotes(self) -> None:
-        """The lane-reads-quotes loop: quote requests only."""
-        self._work(self._step_quotes, lambda: self._qjobs, "quotes")
+        """The lane-reads-quotes loop: quote requests, and the keep-warm call when it is due."""
+        self._work(self._step_quotes, lambda: self._qjobs or self._warm_due(), "quotes")
 
     def _work(self, step: Callable[[], list[Event]], has_work: Callable[[], object], name: str) -> None:
         while True:

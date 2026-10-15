@@ -841,9 +841,11 @@ class Store:
             sql += f" LIMIT {int(limit)}"
         return [_as_dict("events", r) for r in self._conn.execute(sql, params).fetchall()]
 
-    def events_tail(self, n: int = 500) -> list[dict[str, Any]]:
-        rows = self._conn.execute("SELECT * FROM (SELECT * FROM events ORDER BY seq DESC LIMIT ?) ORDER BY seq",
-                                  (int(n),)).fetchall()
+    def events_tail(self, n: int = 500, *, debug: bool = True) -> list[dict[str, Any]]:
+        """The last n events, oldest first; debug=False leaves the DEBUG rows out (the dashboard's tail)."""
+        where = "" if debug else "WHERE severity <> 'DEBUG' "
+        rows = self._conn.execute(f"SELECT * FROM (SELECT * FROM events {where}ORDER BY seq DESC LIMIT ?) "
+                                  "ORDER BY seq", (int(n),)).fetchall()
         return [_as_dict("events", r) for r in rows]
 
     # -- intents and routes ---------------------------------------------------------------------------------

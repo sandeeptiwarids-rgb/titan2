@@ -19,9 +19,16 @@ The rules, from the spec:
   pays one more half-spread on every leg. Zerodha's charges on every order (titan2.charges).
 - Each later trading day but expiry, at about 15:25: if the condor's mid value is >= 3x the entry credit, close it
   (shorts bought back at the ask, then wings sold at the bid). A leg with no bid is marked at half its ask; a wing
-  with no bid is abandoned (no order, nothing back); a short with no ask postpones the stop by a day. No stop on
-  expiry day: cash settlement at NIFTY 50's official close (Kite's day bar), Rs 20 + GST per in-the-money leg and
-  exercise STT on in-the-money longs. Every condor also gets a no-stop result (held to settlement), for information.
+  with no bid is abandoned (no order, nothing back); a short with no ask postpones the stop by a day. A crossed or
+  locked leg (bid at or above the ask) fails the try while a later one is possible (the job tries again 45 s
+  later); at the last try it is marked at its worse side, a short at the higher of bid and ask and a wing at the
+  lower, and a stop buys a short back at no less than its best bid and sells a wing at no more than its best ask,
+  with a note: a crossed quote can never hide the stop (its mid used to be missing, so a crossed short was marked at
+  half its ask). A try is the last when no later one can start before 15:29:30: the job asks at the try's start,
+  again at such a leg's mark, and once more at the try's end, so a try that ran long (a slow Kite call) makes the
+  check itself before it ends. No stop on expiry day: cash settlement at NIFTY 50's official close (Kite's day
+  bar), Rs 20 + GST per in-the-money leg and exercise STT on in-the-money longs. Every condor also gets a no-stop
+  result (held to settlement), for information.
 - Kill rules: after 12 entries, the median real credit is below 85% of the same strikes' day-close credit, or the
   median real spread is above 2x the research cost model's; <= 19 wins in the first 26 or <= 41 in the first 52;
   cumulative net at 2x spreads below -Rs 42,000; any loss beyond 1.05x its computed max loss, or a stored net its
@@ -29,11 +36,15 @@ The rules, from the spec:
 Not built: the T-2/T-1 entry shadows, and the bhavcopy download (each leg's Kite day close stands in for it).
 
 The laptop calls CondorJob.poll() from its supervisor thread on real-time sessions only (never under --date):
-settle_due() once after the start, tick() once a trading day in [15:25, 15:29:30), tried up to 3 times 45 s apart
-while a step fails. A tick counts as done only when no step failed. A missed 15:25 (laptop off) misses that day's
-entry or stop check; settlement catches up at any later start. `titan2 condor [status|dry-run|tick|settle]` does
-the same by hand; tick and settle refuse while a laptop session runs (it does them itself), and every write is
-conditional on the state it read, so two writers can never book one entry, exit or settlement twice.
+record_missed() and settle_due() once after the start, tick() once a trading day in [15:25, 15:29:30), tried up to 3
+times 45 s apart while a step fails. A tick counts as done only when no step failed. A missed 15:25 (laptop off)
+misses that day's entry or stop check, which nothing makes up; settlement catches up at any later start. So each
+start writes a MISSED note, once, for every trading day since the first tick with no completed tick while a condor
+was open and not marked that day (its stop check) or due (the entry day of an expiry the instruments listed at an
+earlier tick), and `titan2 condor status` shows the latest. `titan2 condor [status|dry-run|tick|settle]` does the
+same by hand (a tick by hand is a last try); tick and settle refuse while a laptop session runs (it does them
+itself), and every write is conditional on the state it read, so two writers can never book one entry, exit or
+settlement twice.
 """
 
 from __future__ import annotations
@@ -69,6 +80,10 @@ STEP = 50.0                        # strike rounding
 STOP_MULT = 3.0
 TICK_AT, TICK_UNTIL = dtime(15, 25), dtime(15, 29, 30)
 TICK_ATTEMPTS, RETRY_AFTER_S = 3, 45.0
+POLL_S = 0.2                       # laptop.POLL_S: how often the supervisor polls the job (laptop passes its own)
+RETRY_SPARE_S = 2.0                # a later try counts only if it fits before TICK_UNTIL with this to spare (a late
+#                                    supervisor pass, the try's own last writes)
+MISSED_WHY = "no 15:25 tick was completed (titan2 was not running then, or every try failed)"   # a MISSED note's reason
 QUOTE_MAX_AGE_S = 60.0
 ATM_PCT = 0.03                     # the forward and IV come from the strikes within 3% of spot
 KITE_PAUSE_S = 1.1                 # between this client's Kite calls: quote() allows 1 a second
@@ -91,7 +106,11 @@ SCHEMA = (
     "CREATE TABLE IF NOT EXISTS notes(id INTEGER PRIMARY KEY, ts TEXT NOT NULL, day TEXT NOT NULL, kind TEXT NOT NULL, "
     "detail TEXT NOT NULL)",
     "CREATE TABLE IF NOT EXISTS ticks(day TEXT PRIMARY KEY, ts TEXT NOT NULL, outcome TEXT NOT NULL)",
+    # the NIFTY expiries the instruments listed at a tick (the dump is the authority): which skipped day was an entry
+    #   day (missed_duties)
+    "CREATE TABLE IF NOT EXISTS expiries(expiry TEXT PRIMARY KEY, seen TEXT NOT NULL)",
 )
+MISSED_SHOWN = 3                                 # status_text: the latest MISSED notes it lists
 LEG_ROLES = ("SP", "SC", "LP", "LC")            # short put, short call, long put (wing), long call (wing)
 SHORT = {"SP": True, "SC": True, "LP": False, "LC": False}
 
@@ -186,6 +205,11 @@ class Q:
         mid and book a zero spread, in the real and the 2x fill and in the kill rule's median spread."""
         return self.mid is not None and self.ask > self.bid
 
+    @property
+    def crossed(self) -> bool:
+        """Both sides shown and the ask at or under the bid: a crossed or locked book (the 15:25 mark's retry)."""
+        return self.bid is not None and self.ask is not None and self.ask <= self.bid
+
     def to_json(self) -> dict[str, Any]:
         return {"bid": self.bid, "ask": self.ask, "ltp": self.ltp, "age_s": self.age_s,
                 "bids": [list(x) for x in self.bids], "asks": [list(x) for x in self.asks]}
@@ -273,8 +297,12 @@ def fill_prices(q: Q, sell: bool, qty: int, tick: float) -> dict[str, Any]:
 
 
 def leg_mark(q: Q | None, short: bool) -> float | None:
-    """A leg's mark: its mid; with no bid, half its ask (the middle of 0 and the ask). A short with no ask cannot be
-    bought back: None (unknown). A wing with no ask is marked at its bid, else 0."""
+    """A leg's mark: its mid; with no bid, half its ask (the middle of 0 and the ask). A crossed or locked book is
+    marked at its worse side: a short at the higher of bid and ask, a wing at the lower (a locked one at its price).
+    Its mid used to be missing, so a crossed short fell to half its ask: a 3.70x stop marked 1.40x and held. A short
+    with no ask cannot be bought back: None (unknown). A wing with no ask is marked at its bid, else 0."""
+    if q is not None and q.crossed:
+        return max(q.bid, q.ask) if short else min(q.bid, q.ask)
     if q is not None and q.mid is not None:
         return q.mid
     if q is not None and q.ask is not None:
@@ -282,6 +310,16 @@ def leg_mark(q: Q | None, short: bool) -> float | None:
     if short:
         return None
     return q.bid if q is not None and q.bid is not None else 0.0
+
+
+def worse_side(q: Q) -> Q:
+    """A crossed or locked book as a stop at the last try fills on it (the paper exchange's 15:26 square-off rule): no
+    bid above its best ask and no ask under its best bid, so a short is never bought back under the best bid and a
+    wing never sold over the best ask. Its spread, of which the 2x fill pays one more half, is the crossing's width
+    (0 when locked)."""
+    lo, hi = min(q.bid, q.ask), max(q.bid, q.ask)
+    return Q(lo, hi, q.ltp, tuple((min(px, lo), n) for px, n in q.bids), tuple((max(px, hi), n) for px, n in q.asks),
+             q.age_s)
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -469,8 +507,11 @@ class Ctx:
     out: Out = print
     sleep: Callable[[float], Any] = time.sleep
     mono: Callable[[], float] = time.monotonic
+    last_try: bool = True          # False while the job can still try again today: a crossed leg then fails the mark
+    retry_fits: Callable[[], bool] | None = None    # the job's check, on its clock, that a later try can still start
     t0: float = field(default=0.0, init=False)
     last_call: float | None = field(default=None, init=False)
+    crossed: set[int] = field(default_factory=set, init=False)   # condors whose mark this try left to a later one
 
     def __post_init__(self) -> None:
         self.t0 = self.mono()
@@ -478,6 +519,21 @@ class Ctx:
     @property
     def today(self) -> date:
         return self.now.date()
+
+    def can_retry(self) -> bool:
+        """Whether a later try can still start today, so that a crossed or locked leg may fail this one: never on a
+        last try; else the job's check of its clock when it gave one (CondorJob.retry_fits). Asked when such a leg
+        is seen and again at the try's end, since a slow step can use up the time a retry needed. A check that
+        fails counts as no (the leg is then marked at its worse side: the stop is never left unchecked)."""
+        if self.last_try:
+            return False
+        if self.retry_fits is None:
+            return True
+        try:
+            return bool(self.retry_fits())
+        except Exception:
+            log.exception("condor: the check for a later try failed; this try counts as the last")
+            return False
 
     def wall(self) -> datetime:
         return self.now + timedelta(seconds=max(0.0, self.mono() - self.t0))
@@ -617,8 +673,12 @@ def _describe(e: Mapping[str, Any]) -> str:
 
 
 def enter(ctx: Ctx, con: sqlite3.Connection) -> str:
-    """Enter today if today is an expiry's entry day, nothing is open past today and the test is not killed."""
+    """Enter today if today is an expiry's entry day, nothing is open past today and the test is not killed. The
+    expiries the instruments list are recorded for missed_duties() first."""
     chains, fut = load_chain(ctx)
+    con.executemany("INSERT OR IGNORE INTO expiries(expiry, seen) VALUES (?, ?)",
+                    [(e.isoformat(), ctx.today.isoformat()) for e in sorted(chains) if e > ctx.today])
+    con.commit()
     target = next((e for e in sorted(chains) if e > ctx.today and entry_day_for(e, ctx.cal) == ctx.today), None)
     if target is None:
         return "NOT_ENTRY_DAY"
@@ -649,11 +709,26 @@ def enter(ctx: Ctx, con: sqlite3.Connection) -> str:
 
 
 def mark(ctx: Ctx, con: sqlite3.Connection, row: sqlite3.Row) -> str:
-    """Today's 15:25 mark of an open condor; the 3x stop on any day but expiry."""
+    """Today's 15:25 mark of an open condor; the 3x stop on any day but expiry. On a stop day a crossed or locked leg
+    fails the mark while the job can still try again today (ctx.can_retry()): nothing is marked and it tries 45 s
+    later, unless this try runs too long for that (tick() then marks it again as the last try before it ends). At
+    the last try such a leg is marked at its worse side (leg_mark) and a stop fills on it at its worse side
+    (worse_side), with a MARK note."""
     e = json.loads(row["entry"])
     legs = e["legs"]
     qs = fetch_quotes(ctx, [legs[r]["symbol"] for r in LEG_ROLES])
     by_role = {r: qs.get(legs[r]["symbol"]) for r in LEG_ROLES}
+    crossed = [r for r in LEG_ROLES if by_role[r] is not None and by_role[r].crossed]
+    if crossed and ctx.today < date.fromisoformat(row["expiry"]):
+        books = ", ".join(f"{legs[r]['symbol']} bid {by_role[r].bid:.2f} ask {by_role[r].ask:.2f}" for r in crossed)
+        if ctx.can_retry():
+            ctx.crossed.add(row["id"])
+            note(con, ctx.now, "MARK", f"{row['expiry']}: a crossed or locked book ({books}): the stop check is tried "
+                                       f"again in {RETRY_AFTER_S:.0f} s", ctx.out)
+            return "MARK_FAILED"
+        note(con, ctx.now, "MARK", f"{row['expiry']}: still a crossed or locked book at the last try ({books}): "
+                                   "marked at its worse side (a short at the higher of bid and ask, a wing at the "
+                                   "lower)", ctx.out)
     marks = {r: leg_mark(by_role[r], SHORT[r]) for r in LEG_ROLES}
     value = None if None in marks.values() else sum((1 if SHORT[r] else -1) * marks[r] for r in LEG_ROLES)
     ratio = None if value is None else value / row["credit"]
@@ -672,7 +747,8 @@ def mark(ctx: Ctx, con: sqlite3.Connection, row: sqlite3.Row) -> str:
                 f"{STOP_MULT:g}x): held")
         return "HELD"
     qty = row["qty"]
-    fills = {r: fill_prices(by_role[r], not SHORT[r], qty, legs[r]["tick"]) for r in LEG_ROLES}
+    fills = {r: fill_prices(worse_side(by_role[r]) if r in crossed else by_role[r], not SHORT[r], qty,
+                            legs[r]["tick"]) for r in LEG_ROLES}
     rates = charges.rates_for(ctx.today)
     debit, cost = exit_money(fills, qty, rates, "real")
     debit_2x, cost_2x = exit_money(fills, qty, rates, "x2")
@@ -802,7 +878,9 @@ def _guard(ctx: Ctx, con: sqlite3.Connection, what: str, fn: Callable[[], Any]) 
 def tick(ctx: Ctx, *, force: bool = False) -> str:
     """The 15:25 step: the open condor's mark (and stop) first, then settlement of what is due (so the kill rules
     see it), the entry, and the day-close credits. Recorded as done for the day (ticks table) only when neither the
-    mark nor the entry failed, so a retry is possible; every step is safe to repeat."""
+    mark nor the entry failed, so a retry is possible; every step is safe to repeat. A mark left to a later try (a
+    crossed or locked leg) is made again before the try ends when that try can no longer start in the window (this
+    one ran long): this try is then the last, and the leg is marked at its worse side if it is still crossed."""
     con = connect(ctx.var)
     try:
         day = ctx.today.isoformat()
@@ -810,12 +888,19 @@ def tick(ctx: Ctx, *, force: bool = False) -> str:
             return "ALREADY_TICKED"
         if not ctx.cal.is_trading_day(ctx.today):
             return "NOT_A_TRADING_DAY"
-        outcome = [_guard(ctx, con, "MARK", lambda r=row: mark(ctx, con, r))
-                   for row in _rows(con, "state = 'OPEN' AND expiry >= ?", (day,))]
+        held = _rows(con, "state = 'OPEN' AND expiry >= ?", (day,))
+        outcome = [_guard(ctx, con, "MARK", lambda r=row: mark(ctx, con, r)) for row in held]
         _guard(ctx, con, "SETTLE", lambda: settle_due(ctx, con))
         outcome.append(_guard(ctx, con, "ENTRY", lambda: enter(ctx, con)))
         for row in _rows(con, "close_credit IS NULL AND entry_day < ? AND expiry >= ?", (day, day)):
             _guard(ctx, con, "CLOSE_CREDIT", lambda r=row: record_close_credit(ctx, con, r))
+        if ctx.crossed and not ctx.can_retry():          # the retry its mark counted on cannot start any more
+            ctx.last_try = True
+            for i, row in enumerate(held):
+                if row["id"] in ctx.crossed:
+                    note(con, ctx.now, "MARK", f"{row['expiry']}: no later try can start before {TICK_UNTIL:%H:%M:%S}: "
+                                               "this try is the last, so the stop check is made now", ctx.out)
+                    outcome[i] = _guard(ctx, con, "MARK", lambda r=row: mark(ctx, con, r))
         result = ",".join(outcome)
         if "FAILED" not in result:
             con.execute("INSERT OR REPLACE INTO ticks(day, ts, outcome) VALUES (?, ?, ?)",
@@ -824,6 +909,58 @@ def tick(ctx: Ctx, *, force: bool = False) -> str:
         return result
     finally:
         con.close()
+
+
+def missed_duties(con: sqlite3.Connection, cal: Any, now: datetime) -> list[tuple[date, list[str]]]:
+    """(day, what it skipped) for every trading day after the first recorded tick, up to the last tick window already
+    over (today's once it has passed), with no completed tick (titan2 was not running at 15:25, or every try failed)
+    while a condor was open and not marked that day (its 3x stop check: a mark made by a try whose later step
+    failed, say the entry's instruments call, is a check that was made) or due (the entry day, by today's calendar,
+    of an expiry the instruments listed at an earlier tick, when no condor was open past that day and the test is
+    not killed). Days with nothing open or due are left out. Nothing makes such a duty up: the note is its only
+    trace."""
+    ticked = {r["day"] for r in con.execute("SELECT day FROM ticks")}
+    if not ticked:
+        return []
+    first = date.fromisoformat(min(ticked))
+    last = now.date() if now.time() >= TICK_UNTIL else cal.prev_trading_day(now.date())
+    if last is None or last <= first:
+        return []
+    rows = _rows(con)
+    marked = {(r["condor_id"], r["day"]) for r in con.execute("SELECT condor_id, day FROM marks")}
+    entered = {r["expiry"] for r in rows}
+    due: dict[date, list[str]] = {}
+    if kill_status(rows) is None:
+        for (e,) in con.execute("SELECT expiry FROM expiries ORDER BY expiry"):
+            exp = date.fromisoformat(e)
+            d = entry_day_for(exp, cal) if cal.is_trading_day(exp) else None   # a moved expiry is no longer one
+            if d is not None and e not in entered:
+                due.setdefault(d, []).append(e)
+    out = []
+    for d in cal.trading_days(first + timedelta(days=1), last):
+        day = d.isoformat()
+        if day in ticked:
+            continue
+        open_past = [r for r in rows if r["entry_day"] < day < r["expiry"]
+                     and (r["exit_day"] is None or r["exit_day"] > day)]        # not stopped before that day
+        what = ([f"the 3x stop check of the {r['expiry']} condor" for r in open_past if (r["id"], day) not in marked]
+                if open_past else [f"the entry of the {e} condor" for e in due.get(d, ())])   # one open at a time
+        if what:
+            out.append((d, what))
+    return out
+
+
+def record_missed(con: sqlite3.Connection, cal: Any, now: datetime, out: Out | None = None) -> list[str]:
+    """A MISSED note for each missed duty (missed_duties) not noted yet, the day first in its detail; returns them."""
+    noted = {r["detail"][:10] for r in con.execute("SELECT detail FROM notes WHERE kind = 'MISSED'")}
+    new = []
+    for d, what in missed_duties(con, cal, now):
+        if d.isoformat() in noted:
+            continue
+        detail = f"{d}: {MISSED_WHY}: skipped " + "; ".join(what)
+        note(con, now, "MISSED", detail, out)
+        new.append(detail)
+    return new
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -835,7 +972,9 @@ def status_text(var: Path) -> str:
     con = connect(var, readonly=True)
     try:
         rows = _rows(con)
-        notes = con.execute("SELECT ts, kind, detail FROM notes ORDER BY id DESC LIMIT 3").fetchall()
+        notes = con.execute("SELECT ts, kind, detail FROM notes WHERE kind != 'MISSED' ORDER BY id DESC LIMIT 3"
+                            ).fetchall()
+        missed = [r["detail"] for r in con.execute("SELECT detail FROM notes WHERE kind = 'MISSED' ORDER BY id DESC")]
         marks = {r["condor_id"]: r for r in con.execute("SELECT * FROM marks ORDER BY day")}
     finally:
         con.close()
@@ -856,6 +995,9 @@ def status_text(var: Path) -> str:
                      f"last: {closed[-1]['expiry']} {closed[-1]['exit_reason']} Rs {closed[-1]['net']:,.0f}")
     killed = kill_status(rows)
     lines.append(f"  test: {'KILLED: ' + killed if killed else 'running'} ({len(rows)} of 52 weeks entered)")
+    lines += [f"  MISSED {m}" for m in missed[:MISSED_SHOWN]]
+    if len(missed) > MISSED_SHOWN:
+        lines.append(f"  MISSED {len(missed) - MISSED_SHOWN} earlier day(s) too (condor.db notes, kind MISSED)")
     lines += [f"  note {n['ts'][:16]} {n['kind']}: {n['detail']}" for n in notes]
     return "\n".join(lines)
 
@@ -919,15 +1061,18 @@ def cli(action: str, var: Path, env: Mapping[str, str], out: Out = print, *, kit
 
 
 class CondorJob:
-    """The laptop's condor duty, polled by laptop.Supervisor: settle_due() once after the start (when condor.db
-    exists), tick() once a trading day in [TICK_AT, TICK_UNTIL), tried up to TICK_ATTEMPTS times RETRY_AFTER_S
-    apart while a step fails. Each runs on its own thread; a failure is logged and noted, never raised into the
-    supervisor."""
+    """The laptop's condor duty, polled by laptop.Supervisor every poll_s: record_missed() and settle_due() once after
+    the start (when condor.db exists; the MISSED notes need no Kite), tick() once a trading day in [TICK_AT,
+    TICK_UNTIL), tried up to TICK_ATTEMPTS times RETRY_AFTER_S apart while a step fails. A try is the last
+    (Ctx.last_try) when no other can start before TICK_UNTIL (retry_fits); the try asks again (Ctx.retry_fits) when
+    it sees a crossed leg and at its end, so one that runs long finds out before it ends. Each runs on its own thread;
+    a failure is logged and noted, never raised into the supervisor."""
 
     def __init__(self, var: Path, env: Mapping[str, str], clock: Any, cal: Any, out: Out,
-                 kite_factory: Callable[[], Any] | None = None) -> None:
+                 kite_factory: Callable[[], Any] | None = None, poll_s: float = POLL_S) -> None:
         self.var, self.env, self.clock, self.cal, self.out = Path(var), dict(env), clock, cal, out
         self.kite_factory = kite_factory or (lambda: kite_from_session(self.env, self.var))
+        self.poll_s = poll_s
         self._settled = False
         self._day: date | None = None
         self._attempts = 0
@@ -952,15 +1097,42 @@ class CondorJob:
             return
         self._attempts += 1
         self._last = now
-        self._start("tick", now)
+        self._start("tick", now, not self.retry_fits(now))
 
-    def _start(self, what: str, now: datetime) -> None:
-        self._thread = threading.Thread(target=self._run, args=(what, now), name=f"condor-{what}", daemon=True)
+    def retry_fits(self, at: datetime | None = None) -> bool:
+        """Whether one more try can still start before TICK_UNTIL, if the current one (begun at self._last) ends at
+        `at` (default: the clock now, asked by the try itself). Never after the third. The next try waits for this
+        one's thread to end and for RETRY_AFTER_S since its start, and starts at the supervisor's next pass after
+        both, up to poll_s later: it must fit with RETRY_SPARE_S to spare."""
+        if self._last is None or self._attempts >= TICK_ATTEMPTS:
+            return False
+        at = self.clock.now_wall() if at is None else at
+        start = max(self._last + timedelta(seconds=RETRY_AFTER_S), at)
+        until = datetime.combine(self._last.date(), TICK_UNTIL, tzinfo=self._last.tzinfo)
+        return start + timedelta(seconds=self.poll_s + RETRY_SPARE_S) < until
+
+    def _start(self, what: str, now: datetime, last_try: bool = True) -> None:
+        self._thread = threading.Thread(target=self._run, args=(what, now, last_try), name=f"condor-{what}",
+                                        daemon=True)
         self._thread.start()
 
-    def _run(self, what: str, now: datetime) -> None:
+    def _note_missed(self, now: datetime) -> None:
         try:
-            ctx = Ctx(self.var, self.kite_factory(), self.cal, now, self.out)
+            con = connect(self.var)
+            try:
+                record_missed(con, self.cal, now, self.out)
+            finally:
+                con.close()
+        except Exception as exc:
+            log.exception("condor: missed duties not checked")
+            self.out(f"condor: missed 15:25 duties not checked ({exc})")
+
+    def _run(self, what: str, now: datetime, last_try: bool = True) -> None:
+        if what == "settle":
+            self._note_missed(now)                       # before the Kite client, which it does not need
+        try:
+            ctx = Ctx(self.var, self.kite_factory(), self.cal, now, self.out, last_try=last_try,
+                      retry_fits=self.retry_fits if what == "tick" else None)
             if what == "tick":
                 outcome = tick(ctx)
                 log.info("condor tick (attempt %d): %s", self._attempts, outcome)

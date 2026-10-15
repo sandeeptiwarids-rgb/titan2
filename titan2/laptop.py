@@ -34,7 +34,11 @@ Windows ends a process about 5 s after its console closes, so a close gets the f
 stop. Signal handlers only set flags; the "laptop" thread (Supervisor) does the work and the printing.
 
 While a session runs, SetThreadExecutionState keeps Windows from sleeping on its idle timer (closing the lid still
-sleeps it), and the power source is logged at the start and every 15 min (a WARNING on battery). The console gets
+sleeps it), and the power source is logged at the start and every 15 min (a WARNING on battery); it is looked at
+every 30 s, and a switch from AC to battery is a WARN POWER on the phone (back on AC after it, one INFO). The
+self-check also reads, as a standard user, the laptop settings that can end a session (lid_close_action,
+restart_pending, update_active_hours, wifi_auto_connect: its lid, restart_pending, update_hours and wifi rows, WARN
+only). The console gets
 the log through a queue, with QuickEdit off, so a console that stops reading never blocks the core thread; the log
 file is logs/laptop-<date>.log (30 days kept). clock_offset_s() measures this clock against internet time (SNTP,
 then the HTTP Date header of api.kite.trade) for the self-check, which blocks entries beyond 1 s, the reading's own
@@ -81,6 +85,8 @@ DASH_PORT = 5000
 REQUESTED_BY = "laptop-ctrl-c"                       # commands_cli.db requested_by of the Ctrl+C flatten (the bot's
 #                                                      EngineContext.stop_flatten_by is "CLI:" + this)
 POWER_LOG_EVERY_S = 900.0
+POWER_WATCH_S = 30.0                                 # the power source is looked at this often: a switch to battery
+#                                                      reaches the phone (Supervisor._watch_power)
 CLOCK_REFRESH_S = 300.0                              # internet time re-measured this often (titan2.clock.CORRECTION)
 CLOCK_RETRY_S = 20.0                                 # ... and this often while there is none, or after a clock step
 CLOCK_COARSE_S = 0.25                                # a reading less exact than this never replaces a better one
@@ -275,6 +281,116 @@ def network_probe() -> Any:
     from titan2 import net
 
     return net.tcp_probe()
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Laptop settings that can end a session (the self-check's lid, restart_pending, update_hours and wifi rows; WARN
+# only, all read as a standard user, 2026-10-14 night). Each probe answers None when it cannot tell (not Windows, a
+# tool missing, timed out or answering in another language): the row then SKIPs, never FAILs.
+# ---------------------------------------------------------------------------------------------------------------
+PROBE_TIMEOUT_S = 10.0
+LID_ACTIONS = {0: "do nothing", 1: "sleep", 2: "hibernate", 3: "shut down"}      # powercfg's LIDACTION index
+POWERCFG_LID = ("powercfg", "/qh", "SCHEME_CURRENT", "SUB_BUTTONS", "LIDACTION")
+REBOOT_REQUIRED_KEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired"
+UPDATE_UX_KEY = r"SOFTWARE\Microsoft\WindowsUpdate\UX\Settings"                 # ActiveHoursStart / ActiveHoursEnd
+WIFI_PROFILES_MAX = 30                       # Wi-Fi profiles read one by one (netsh), at most this many
+_LID_INDEX = re.compile(r"Current (AC|DC) Power Setting Index:\s*0x([0-9a-fA-F]+)")
+_HEX_INDEX = re.compile(r":\s*0x([0-9a-fA-F]+)\s*$", re.M)
+_WIFI_PROFILE = re.compile(r"^\s*(?:All|Current) User Profile\s*:\s*(.+?)\s*$", re.M)
+_WIFI_MODE = re.compile(r"^\s*Connection mode\s*:\s*(.+?)\s*$", re.M)
+
+
+def run_tool(cmd: tuple[str, ...] | list[str], timeout_s: float = PROBE_TIMEOUT_S) -> tuple[int, str] | None:
+    """(returncode, output) of a read-only Windows tool, or None when it cannot run (not Windows, missing, timed
+    out). No window opens, nothing is written."""
+    if not WINDOWS:
+        return None
+    try:
+        p = subprocess.run(list(cmd), capture_output=True, text=True, errors="replace", timeout=timeout_s,
+                           stdin=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        log.info("%s could not run: %s", cmd[0], exc)
+        return None
+    return p.returncode, (p.stdout or "") + (p.stderr or "")
+
+
+def lid_close_action(run: Callable[..., tuple[int, str] | None] | None = None) -> tuple[int, int] | None:
+    """What closing the lid does on AC and on battery, as powercfg's LIDACTION index (LID_ACTIONS: 0 do nothing,
+    1 sleep, 2 hibernate, 3 shut down), from `powercfg /qh SCHEME_CURRENT SUB_BUTTONS LIDACTION` (the setting is
+    hidden from plain /q); None when it cannot be read."""
+    got = (run or run_tool)(POWERCFG_LID, PROBE_TIMEOUT_S)
+    if got is None or got[0] != 0:
+        return None
+    out = got[1]
+    named = {k: int(v, 16) for k, v in _LID_INDEX.findall(out)}
+    if {"AC", "DC"} <= set(named):
+        return named["AC"], named["DC"]
+    found = _HEX_INDEX.findall(out)                  # another language: AC is listed before DC
+    return (int(found[0], 16), int(found[1], 16)) if len(found) == 2 else None
+
+
+def _reg_value(path: str, name: str | None) -> Any:
+    """HKLM\\<path>'s value `name` (None: True when the key exists). FileNotFoundError when it is absent."""
+    import winreg                                    # Windows only
+
+    flags = winreg.KEY_READ | getattr(winreg, "KEY_WOW64_64KEY", 0)
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path, 0, flags) as key:
+        return True if name is None else winreg.QueryValueEx(key, name)[0]
+
+
+def restart_pending(reg: Callable[[str, str | None], Any] | None = None) -> bool | None:
+    """Windows Update waits for a restart (its RebootRequired key exists); None when the registry cannot be read."""
+    read = reg if reg is not None else (_reg_value if WINDOWS else None)
+    if read is None:
+        return None
+    try:
+        read(REBOOT_REQUIRED_KEY, None)
+    except FileNotFoundError:
+        return False
+    except Exception as exc:                         # OSError (access), or anything odd: cannot tell
+        log.info("restart-pending key not readable: %r", exc)
+        return None
+    return True
+
+
+def update_active_hours(reg: Callable[[str, str | None], Any] | None = None) -> tuple[int, int] | None:
+    """Windows Update's active hours (start, end), whole hours 0-23: outside them Windows may restart the laptop to
+    install updates. None when they are not set or cannot be read."""
+    read = reg if reg is not None else (_reg_value if WINDOWS else None)
+    if read is None:
+        return None
+    try:
+        start, end = read(UPDATE_UX_KEY, "ActiveHoursStart"), read(UPDATE_UX_KEY, "ActiveHoursEnd")
+    except Exception as exc:
+        log.info("active hours not readable: %r", exc)
+        return None
+    for h in (start, end):
+        if isinstance(h, bool) or not isinstance(h, int) or not 0 <= h <= 23:
+            return None
+    return start, end
+
+
+def wifi_auto_connect(run: Callable[..., tuple[int, str] | None] | None = None) -> tuple[list[str], int] | None:
+    """(the saved Wi-Fi networks set to connect automatically, how many saved networks were read), from
+    `netsh wlan show profiles` and `netsh wlan show profile name=<each>` (never key=clear: no password is ever
+    read). None when they cannot be listed: no Wi-Fi, its service off, or netsh answering in another language."""
+    tool = run or run_tool
+    got = tool(("netsh", "wlan", "show", "profiles"), PROBE_TIMEOUT_S)
+    if got is None or got[0] != 0:
+        return None
+    names = list(dict.fromkeys(_WIFI_PROFILE.findall(got[1])))
+    if not names:
+        return ([], 0) if "User profiles" in got[1] else None
+    auto, read = [], 0
+    for name in names[:WIFI_PROFILES_MAX]:
+        one = tool(("netsh", "wlan", "show", "profile", f"name={name}"), PROBE_TIMEOUT_S)
+        mode = _WIFI_MODE.search(one[1]) if one is not None and one[0] == 0 else None
+        if mode is None:
+            continue
+        read += 1
+        if "automatic" in mode.group(1).lower():
+            auto.append(name)
+    return (auto, read) if read else None
 
 
 def power_text(status: Mapping[str, Any]) -> str:
@@ -629,7 +745,8 @@ class Supervisor:
     def __init__(self, *, ctl: CtrlC, session: Session, var: Path, clock: Any, out: Out, cli_mod: Any = None,
                  power: Callable[[], Mapping[str, Any]] = power_status, mono: Callable[[], float] = time.monotonic,
                  power_every_s: float = POWER_LOG_EVERY_S, poll_s: float = POLL_S,
-                 clock_keeper: Callable[[], Any] | None = None, clock_every_s: float = CLOCK_REFRESH_S) -> None:
+                 clock_keeper: Callable[[], Any] | None = None, clock_every_s: float = CLOCK_REFRESH_S,
+                 power_watch_s: float = POWER_WATCH_S) -> None:
         from titan2 import store as store_mod
 
         self.ctl, self.session, self.clock, self.out = ctl, session, clock, out
@@ -638,6 +755,13 @@ class Supervisor:
         self.cli_db = Path(var) / "db" / self.cli.CLI_DB
         self.power, self.mono = power, mono
         self.power_every_s, self.poll_s = power_every_s, poll_s
+        # the power watch (2026-10-14 night): AC to battery reaches the phone, not only the log
+        self.power_watch_s = power_watch_s
+        self._next_watch = 0.0
+        self._on_ac: bool | None = None                  # None until the first reading that knows
+        self._battery_since: float | None = None
+        self._battery_alerted = False                    # the battery WARN reached the alerter: say when AC is back
+        self._power_alerts: list[tuple[str, str, str, str]] = []     # waiting for a running bot's alerter
         self.finished = threading.Event()
         self.dash: Any = None                            # the dashboard's Popen, watched once started
         self.condor: Any = None                          # condor.CondorJob: the PAPER condor's 15:25 duty
@@ -664,6 +788,9 @@ class Supervisor:
             self._thread.join(2.0)
         if self.condor is not None:
             self.condor.join(10.0)                       # a tick in flight finishes its paper booking
+        for _, code, text, _ in self._power_alerts:      # the run is over: no alerter is left to send them
+            log.warning("%s not sent to the phone (the session ended first): %s", code, text)
+        self._power_alerts.clear()
 
     def _run(self) -> None:
         while not self.finished.is_set():
@@ -676,9 +803,10 @@ class Supervisor:
     # -- one pass -----------------------------------------------------------------------------------------------
     def step(self) -> None:
         now = self.mono()
-        if now >= self._next_power:
-            self._next_power = now + self.power_every_s
-            self.log_power()
+        try:
+            self._watch_power(now)
+        except Exception:                                # never in the way of a Ctrl+C below
+            log.exception("laptop: power watch failed")
         self._watch_dash()
         presses = self.ctl.presses
         if presses > self._handled:
@@ -722,13 +850,75 @@ class Supervisor:
         except Exception:
             log.exception("laptop: clock refresh failed")
 
-    def log_power(self) -> None:
-        status = self.power()
+    def log_power(self, status: Mapping[str, Any] | None = None) -> None:
+        status = self.power() if status is None else status
         if status.get("on_ac") is False:
             log.warning("power: %s: plug in the charger; a laptop that sleeps or shuts down stops managing its "
                         "positions", power_text(status))
         else:
             log.info("power: %s", power_text(status))
+
+    def _watch_power(self, now: float) -> None:
+        """The power log line every power_every_s (and at once on a change), and a look every power_watch_s for a
+        change of source (2026-10-14 night: a switch to battery was a log line only). AC to battery is one WARN POWER
+        on the phone; back on AC after it, one INFO. The first reading only notes the source: the start card's power
+        row reports it. The alerts go through the running bot's alerter (its 30-minute WARN dedup keeps a loose
+        plug from ringing the phone over and over); between in-process restarts they wait for the next one."""
+        log_due, watch_due = now >= self._next_power, now >= self._next_watch
+        if log_due or watch_due:
+            self._next_watch = now + self.power_watch_s
+            status = self.power()
+            changed = self._power_changed(status, now)
+            if log_due or changed:
+                self._next_power = now + self.power_every_s
+                self.log_power(status)
+        self._send_power_alerts()
+
+    def _power_changed(self, status: Mapping[str, Any], now: float) -> bool:
+        on_ac = status.get("on_ac")
+        if on_ac is not True and on_ac is not False:     # unknown: nothing is judged
+            return False
+        prev, self._on_ac = self._on_ac, on_ac
+        if prev is None or prev is on_ac:
+            return False
+        pct = status.get("battery_pct")
+        charge = f" (battery {pct}%)" if pct is not None else ""
+        at = f"{self.clock.now_wall():%H:%M:%S}"
+        if on_ac is False:
+            self._battery_since, self._battery_alerted = now, False
+            self._power_alert("WARN", "POWER", f"the laptop switched to battery power at {at}{charge}: plug the "
+                              "charger in. On battery Windows may sleep or cut the Wi-Fi, and a laptop that sleeps or "
+                              "shuts down stops managing its positions", "power:battery")
+            return True
+        pending = [a for a in self._power_alerts if a[3] == "power:battery"]
+        for a in pending:                                # never sent: the episode is over, nothing to say
+            self._power_alerts.remove(a)
+        if self._battery_alerted and not pending:
+            mins = (now - self._battery_since) / 60.0 if self._battery_since is not None else 0.0
+            self._power_alert("INFO", "POWER", f"back on AC power at {at}{charge}, after {mins:.0f} min on battery",
+                              "power:ac")
+        self._battery_since, self._battery_alerted = None, False
+        return True
+
+    def _power_alert(self, severity: str, code: str, text: str, key: str) -> None:
+        """Queue a power alert for the running bot's alerter (_send_power_alerts)."""
+        self._power_alerts.append((severity, code, text, key))
+
+    def _send_power_alerts(self) -> None:
+        if not self._power_alerts:
+            return
+        alerter = getattr(self.session.bot, "alerter", None)
+        if alerter is None or getattr(alerter, "running", True) is not True:
+            return                                       # no running bot (a restart in between): the next one
+        while self._power_alerts:
+            severity, code, text, key = self._power_alerts.pop(0)
+            try:
+                accepted = alerter.submit(severity, code, text, key)
+            except Exception:
+                log.exception("laptop: the %s alert could not be queued", code)
+                accepted = False
+            if key == "power:battery":
+                self._battery_alerted = bool(accepted)
 
     def _watch_dash(self) -> None:
         if self.dash is None or self._dash_noted:
@@ -958,7 +1148,8 @@ def another_runs(var: Path) -> bool:
 
 
 def print_report(var: Path, day: date, now: datetime, out: Out) -> None:
-    """The day's report (ledger.daily_report) from titan2.db, read-only; nothing when there is no database."""
+    """The day's report (ledger.daily_report) from titan2.db, read-only; nothing when there is no database. Its
+    Checks section gives the saved what-if days (today's is printed right after it)."""
     from titan2 import ledger, store as store_mod
 
     path = Path(var) / "db" / store_mod.DB_FILENAME
@@ -967,7 +1158,7 @@ def print_report(var: Path, day: date, now: datetime, out: Out) -> None:
     try:
         st = store_mod.open_readonly(path)
         try:
-            out(ledger.daily_report(st, day, now).markdown)
+            out(ledger.daily_report(st, day, now, reports_dir=Path(var) / "reports").markdown)
         finally:
             st.close()
     except Exception as exc:
@@ -984,11 +1175,80 @@ def _condor_job(env: Mapping[str, str], var: Path, clock: Any, cal: Any, out: Ou
     try:
         from titan2 import condor
 
-        return condor.CondorJob(var, env, clock, cal, out)
+        return condor.CondorJob(var, env, clock, cal, out, poll_s=POLL_S)     # the Supervisor polls it this often
     except Exception as exc:
         log.exception("condor job not started")
         out(f"condor: not started today ({exc}); the trading session is unaffected")
         return None
+
+
+CARD_ROWS = ("clock", "network", "power")           # always on the start card, each on a line of its own
+CARD_DETAIL_MAX = 220                                # a row's text on the card (the console and the log have it all)
+
+
+def _card_text(text: Any) -> str:
+    t = " ".join(str(text).split())
+    return t if len(t) <= CARD_DETAIL_MAX else t[:CARD_DETAIL_MAX - 3] + "..."
+
+
+def _mode_text(mode: str | None) -> str:
+    return "LIVE (runs as PAPER here)" if mode == "LIVE" else mode or "?"
+
+
+def start_card(report: Any, *, error: str | None, versions: Mapping[str, str], modes: Mapping[str, str],
+               condor: str, signals_on: bool) -> str:
+    """The START_CARD phone message (runtime.BotProcess sends it once the bot's laptop self-check is done after prep,
+    as its signals start): titan2 is up, PAPER only; the self-check's result with every FAIL and WARN row; the
+    clock, network and power rows (AC or battery); each strategy's mode and version; the PAPER condor. report is
+    the selfcheck.Report, or None when the self-check did not run (error says why). A quiet day leaves the phone
+    silent, so this card is what says titan2 is alive."""
+    lines = ["titan2 is up on the laptop: PAPER only (no order reaches Zerodha); signals "
+             + ("on" if signals_on else "NOT on yet")]
+    if report is None:
+        lines.append(f"self-check did not run ({error or 'no reason given'}): new entries may stay off; see the log")
+    else:
+        results = list(report.results)
+        n = {s: sum(1 for r in results if r.status == s) for s in ("FAIL", "WARN", "PASS", "SKIP")}
+        counts = f"{n['FAIL']} fail, {n['WARN']} warn, {n['PASS']} pass" + (f", {n['SKIP']} skip" if n["SKIP"] else "")
+        head = "PASS" if report.ok else "FAIL: new entries stay off until it is fixed; exits run"
+        lines.append(f"self-check {head} ({counts})")
+        for status in ("FAIL", "WARN"):
+            lines += [f"{status} {r.name}: {_card_text(r.detail)}" for r in results
+                      if r.status == status and r.name not in CARD_ROWS]
+        for name in CARD_ROWS:
+            r = report.result(name)
+            if r is not None:
+                lines.append(f"{name}{'' if r.status == 'PASS' else ' ' + r.status}: {_card_text(r.detail)}")
+    lines.append("strategies: " + ("; ".join(f"{name} {_mode_text(modes.get(name))} {version}"
+                                             for name, version in sorted(versions.items())) or "none loaded"))
+    lines.append(f"condor: {condor}")
+    return "\n".join(lines)
+
+
+def condor_brief(var: Path, env: Mapping[str, str]) -> str:
+    """Where the PAPER condor stands, in one line for the start card and the 15:38 phone report (titan2.condor,
+    read-only); never raises. From `titan2 condor status` it keeps the open condor, the closed ones with the last
+    close and its reason (a 3x stop shows there), the test, and the latest missed 15:25 duty, shortened, with how
+    many there are: until review round 5 it kept only the first and the test, so the phone heard of neither."""
+    if str(env.get("TITAN2_CONDOR", "1")).strip() == "0":
+        return "off (TITAN2_CONDOR=0)"
+    try:
+        from titan2 import condor
+
+        if not condor.db_path(var).is_file():
+            return "no condor yet"
+        lines = [" ".join(ln.split()) for ln in condor.status_text(var).splitlines()[1:]]
+        why = f"{condor.MISSED_WHY}: "
+    except Exception as exc:
+        log.exception("condor status for the start card failed")
+        return f"status unavailable ({type(exc).__name__}); `titan2 condor` shows it"
+    keep = [ln for ln in lines if ln.startswith(("OPEN", "closed ", "test:"))]
+    missed = [ln.removeprefix("MISSED ") for ln in lines if ln.startswith("MISSED ")]   # the latest first
+    if missed:
+        more = re.fullmatch(r"(\d+) earlier day\(s\) too .*", missed[-1])          # past the ones status_text lists
+        n = len(missed) - 1 + int(more.group(1)) if more else len(missed)
+        keep.append(f"MISSED {missed[0].replace(why, '', 1)}" + (f" ({n} missed days in all)" if n > 1 else ""))
+    return "; ".join(keep) or "none open"
 
 
 def print_condor(var: Path, out: Out) -> None:
@@ -1026,38 +1286,62 @@ def _bot_loop(session: Session, *, env: Mapping[str, str], clock: Any, calendar:
               bot_factory: Callable[..., Any] | None, bot_kwargs: Mapping[str, Any] | None,
               sleep: Callable[[float], Any]) -> int:
     """BotProcess runs until the day is done or a stop is requested; exit 75 restarts at once and exit 3 up to
-    CRASH_RESTARTS times (on Linux systemd does both). Only the first run raises the self-check's halts."""
-    from titan2 import runtime
+    CRASH_RESTARTS times (on Linux systemd does both). Only the first run raises the self-check's halts. The phone's
+    START_CARD comes once a session, from the first run that gets as far as its self-check result (its card_sent):
+    each restart sent its own until review round 5, and until round 6 a first run that ended before its card (a
+    crash in prep, or exit 75) left the session without one. The phone hears of each restart (BOT_RESTARTED, sent
+    by the restarted bot's alerter: a WARN after a crash; an INFO after a controlled restart, since round 6, which
+    otherwise ended on the FEED_DEAD or TOKEN alert that announced it) and of the give-up after the last crash
+    restart (CRITICAL BOT_GAVE_UP, which also pings the dead-man's /fail; kept for the next start if the network is
+    down): before 2026-10-14 night both went to the console only."""
+    from titan2 import alerts, runtime
+    from titan2.core.events import Alert
 
     factory = bot_factory or runtime.BotProcess
-    crashes, first = 0, True
+    crashes, first, carded = 0, True, False          # carded: this session's START_CARD went out
     code = runtime.EXIT_OK
+    notes: list[Alert] = []                          # for the next run's alerter
     while session.reason is None:
         kwargs = dict(bot_kwargs or {})
         kwargs.update(env=dict(env), clock=clock, calendar=calendar, laptop=True, install_signals=False,
-                      boot_halts=list(halts) if first else [])
-        first = False
+                      boot_halts=list(halts) if first else [], boot_alerts=notes, start_card=not carded)
+        first, notes = False, []
         bot = factory(**kwargs)
         session.bind(bot)
         try:
             code = bot.run()
         finally:
             session.bind(None)
+        carded = carded or getattr(bot, "card_sent", False) is True      # final once run() has returned
         if session.reason is not None or code == runtime.EXIT_OK:
             break
         if code == runtime.EXIT_RESTART:
             out("titan2: controlled restart (a new Kite session, or the WS feed gave up): recovery resumes the exits")
+            notes = [Alert("INFO", "BOT_RESTARTED", f"titan2 (laptop) made a controlled restart (exit 75: a new Kite "
+                           f"session, or the WS feed gave up) at {clock.now_wall():%H:%M:%S} and is starting again; "
+                           "recovery resumes the exits", "bot:restart")]
             continue
         if code == runtime.EXIT_EXCEPTION_STORM and crashes < CRASH_RESTARTS:
             crashes += 1
             out(f"titan2 crashed (exit 3): restart {crashes} of {CRASH_RESTARTS} in {CRASH_RESTART_S:.0f} s; recovery "
                 "resumes the exits (Ctrl+C stops instead)")
+            notes = [Alert("WARN", "BOT_RESTARTED", f"titan2 (laptop) crashed (exit 3) at {clock.now_wall():%H:%M:%S} "
+                           f"and was restarted: restart {crashes} of {CRASH_RESTARTS} in this session; recovery "
+                           f"resumes the exits. After {CRASH_RESTARTS} restarts it stops and says so", "bot:restart")]
             for _ in range(int(CRASH_RESTART_S / POLL_S)):
                 if session.reason is not None:
                     break
                 sleep(POLL_S)
             continue
         break
+    if code == runtime.EXIT_EXCEPTION_STORM and session.reason is None and crashes >= CRASH_RESTARTS:
+        text = (f"titan2 (laptop) stopped after {crashes + 1} crashes (exit 3; {CRASH_RESTARTS} restarts used): open "
+                "positions are NOT managed now. Read the log, then start run_today.ps1 again: recovery resumes the "
+                "exits")
+        try:
+            alerts.critical_now(text, code="BOT_GAVE_UP", env=env, outbox=alerts.outbox_path(default_var_dir(env)))
+        except Exception:
+            log.exception("the give-up alert could not be sent")
     if session.reason is not None and code == runtime.EXIT_RESTART:
         code = runtime.EXIT_OK                       # a stop was asked for: nothing is to be restarted
     return code
@@ -1103,8 +1387,8 @@ def run_day(env: Mapping[str, str], *, out: Out = print, clock: Any = None, cale
     out(f"titan2 laptop: PAPER only. State {var}; logs {logs}; env file {env_file}")
     if not env_file.is_file():
         out(f"no env file at {env_file}: create it with ZERODHA_API_KEY, ZERODHA_API_SECRET, ZERODHA_USER_ID, "
-            "ZERODHA_PASSWORD and ZERODHA_TOTP_SECRET lines (KEY=value; TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID too "
-            "for alerts)")
+            "ZERODHA_PASSWORD and ZERODHA_TOTP_SECRET lines (KEY=value; NTFY_TOPIC too for phone alerts, and "
+            "HEALTHCHECK_URL for the dead-man check: docs/LAPTOP.md section 2)")
     if str(e.get("ALLOW_LIVE", "")).strip() == "1":
         out(f"ALLOW_LIVE=1 is ignored: the laptop never trades LIVE ({'; '.join(LIVE_REFUSED_REASONS)}). LIVE-mode "
             "strategies run as PAPER today")

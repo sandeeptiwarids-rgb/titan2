@@ -34,6 +34,7 @@ from titan2.core import operator, positions
 from titan2.core.events import Cancel, Place, SelfcheckResult
 from titan2.market.feed import Feed, SignalQueue
 from titan2.market.quotes import QuoteCache
+from titan2.net import Probe
 from titan2.model import (
     EXPIRY_RULE_NEAREST, Account, Direction, Halt, HaltClears, Intent, OrderRequest, Policy, Recheck, Role, Side,
     StrikePref, StructureType, make_tag,
@@ -1604,12 +1605,15 @@ def test_laptop_session_in_process(tmp_path, monkeypatch, caplog, token_ok):
 
     monkeypatch.setattr(runtime.selfcheck, "run_phase", in_bot_selfcheck)
     kite, ticker, seen = TradingKite(), FakeTicker(), {}
+    runtimes: list[runtime.Runtime] = []
     ban_text = f"Securities in Ban For Trade Date {S:%d-%b-%Y}:\nNIL\n".upper()
     sell = OrderRequest(account=Account.LIVE, tag=make_tag(Role.EXIT, Account.LIVE, S, 1, 1), role=Role.EXIT,
                         symbol="NFO:RELIANCE26OCT2900CE", tradingsymbol="RELIANCE26OCT2900CE", exchange="NFO",
                         token=12345, side=Side.SELL, qty=500, limit_px=100.0, lot_size=500, tick=0.05)
 
     def watch(rt: runtime.Runtime) -> None:
+        runtimes.append(rt)
+
         def run() -> None:
             deadline = time.monotonic() + 30
             while time.monotonic() < deadline and not (rt.ready and rt.feed_started and phases):
@@ -1678,6 +1682,18 @@ def test_laptop_session_in_process(tmp_path, monkeypatch, caplog, token_ok):
     assert "CLOCK_UNSYNCED" in halts and "FLATTEN" not in halts  # the self-check's halt, raised at boot, stays
     assert ("TOKEN" in halts) is not token_ok                   # no session: entries off, recovery and READY anyway
     assert any(a[1] == "HALT_CLOCK_UNSYNCED" for a in rec.sent)
+    # the in-bot laptop self-check's result brings the phone's start card (here: it did not run, and says so)
+    (rt,) = runtimes
+    rt.selfcheck._thread.join(10)
+    cards = [a for a in rec.sent if a[1] == "START_CARD"]
+    assert len(cards) == 1 and cards[0][0] == "INFO" and cards[0][3] == "start_card"
+    assert "PAPER only" in cards[0][2]
+    assert "self-check did not run (RuntimeError('not run in this test'))" in cards[0][2]
+    assert rt.reads_lane.active is not None                    # lane-reads-quotes keeps Kite's connection warm
+    # information for the core (2026-10-14 night): the lane's measured quote calls, the alerter's counters (this
+    #   stand-in keeps none) and the laptop's condor line for the 15:38 phone report
+    assert rt.ctx.take_quote_calls == rt.reads_lane.take_quote_calls
+    assert rt.ctx.alert_counts() == {} and rt.ctx.report_notes() == {"condor": "no condor yet"}
     names = {"signals", "prep", "lane-live-orders", "lane-reads", "lane-reads-quotes", "paper-sim", "laptop"}
     assert not [t.name for t in threading.enumerate() if t.name in names and t.is_alive()]
 
@@ -1721,6 +1737,13 @@ def test_laptop_day_in_process_to_the_close(tmp_path, monkeypatch, caplog):
     monkeypatch.setattr(selfcheck.System, "disk_free", lambda self, path: 100 * selfcheck.GB)
     monkeypatch.setattr(laptop, "clock_offset_s", lambda timeout_s=2.0: 6.0)
     monkeypatch.setattr(laptop, "power_status", lambda kernel32=None: laptop.PowerStatus(on_ac=True, battery_pct=99))
+    # the network row's TCP connects and the laptop-settings rows' host reads (powercfg, netsh, the registry,
+    #   2026-10-14 night) are scripted too, so the run stays offline and the same on every host
+    monkeypatch.setattr(laptop, "network_probe", lambda: Probe("api.kite.trade", 8, 8, 0, 20.0, 30.0))
+    monkeypatch.setattr(laptop, "lid_close_action", lambda run=None: (0, 1))
+    monkeypatch.setattr(laptop, "restart_pending", lambda reg=None: False)
+    monkeypatch.setattr(laptop, "update_active_hours", lambda reg=None: (7, 1))
+    monkeypatch.setattr(laptop, "wifi_auto_connect", lambda run=None: (["Home"], 1))
     real_run_phase, phases = selfcheck.run_phase, []
 
     def run_phase(phase: str, ctx: Any) -> Any:             # the pre-bot run is real; the in-bot one is not run here

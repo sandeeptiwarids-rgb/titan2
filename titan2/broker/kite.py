@@ -16,6 +16,8 @@
   (dropped_before_response). Nothing else is retried: not a timeout (one while sending the request included), a
   malformed status line or headers, a failed connect, an SSL error or any answer from Kite, and no other read or
   order.
+- KiteData.last_quote (2026-10-14 night) says what the last quote() spent inside Kite's calls (CallTiming: the tries,
+  and the time without the waits for the quote bucket's tokens), for the quote lane's measurement of every call.
 
 kiteconnect is never imported at module level: its package __init__ imports the twisted ticker, and this module
 must import on Windows without twisted. The adapter only needs the client object it is given.
@@ -421,6 +423,16 @@ def _require_live(account: Any, what: str) -> None:
         raise ReadFailed(format_error(REJECTED, LOCAL, f"{what}: Kite serves account LIVE only, not {account}"))
 
 
+@dataclass(slots=True)
+class CallTiming:
+    """What one KiteData.quote() spent in Kite's own calls (KiteData.last_quote): tries is 2 when a connection that
+    dropped before any answer was asked again once, kite_s the time inside those calls. The waits for the quote
+    bucket's tokens are left out, so a slow kite_s is the network or Kite, never titan2's own 1-a-second pacing."""
+
+    tries: int = 0
+    kite_s: float = 0.0
+
+
 # ---------------------------------------------------------------------------------------------------------------
 # KiteData: reads only
 # ---------------------------------------------------------------------------------------------------------------
@@ -436,6 +448,7 @@ class KiteData:
         self._clock = clock if clock is not None else RealClock()
         self._buckets = buckets if buckets is not None else default_buckets()
         self.dropped_retries = 0          # quote() calls retried after a dropped connection (this process)
+        self.last_quote: CallTiming | None = None    # the last quote()'s time in Kite (read by the quote lane)
 
     def _quote_dropped(self, n: int) -> Callable[[BaseException], None]:
         def note(exc: BaseException) -> None:
@@ -482,6 +495,7 @@ class KiteData:
     # -- market data (DataPort) ---------------------------------------------------------------------------------
     def quote(self, symbols: Sequence[str]) -> dict[str, Quote]:
         """Depth quotes. A symbol Kite omits, or sends malformed (logged), is absent from the result."""
+        self.last_quote = None                           # set again below once a call is made
         syms = list(dict.fromkeys(symbols))
         if not syms:
             return {}
@@ -501,8 +515,18 @@ class KiteData:
                     log.warning("REST quote %s dropped as malformed: %s", sym, exc)
             return out
 
-        return _read(self._buckets.quote, lambda: self._kite.quote(syms), normalize,
-                     on_dropped=self._quote_dropped(len(syms)))
+        timing = self.last_quote = CallTiming()
+        mono = self._clock.mono
+
+        def call() -> Any:
+            timing.tries += 1
+            started = mono()
+            try:
+                return self._kite.quote(syms)
+            finally:
+                timing.kite_s += mono() - started
+
+        return _read(self._buckets.quote, call, normalize, on_dropped=self._quote_dropped(len(syms)))
 
     def ltp(self, symbols: Sequence[str]) -> dict[str, float]:
         syms = list(dict.fromkeys(symbols))

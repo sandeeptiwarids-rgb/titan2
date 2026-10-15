@@ -59,7 +59,8 @@ notepad "$env:APPDATA\titan2\titan2.env"
 | `ZERODHA_TOTP_SECRET` | Your TOTP secret: the text key behind the 2FA QR code, not a 6-digit code | the automatic morning login |
 | `TELEGRAM_BOT_TOKEN` | A Telegram bot's token, from @BotFather | optional alerts and the daily report |
 | `TELEGRAM_CHAT_ID` | Your chat id: send your bot a message, then open `https://api.telegram.org/bot<token>/getUpdates` and copy the number after `"chat":{"id":` | optional alerts and the daily report |
-| `NTFY_TOPIC` | A long random name (20-64 letters, digits, `-`, `_`) for the free ntfy phone app: install ntfy, tap +, subscribe to this name on ntfy.sh. Anyone who knows the name can read the alerts, so keep it private | optional alerts and the daily report (instead of, or as well as, Telegram) |
+| `NTFY_TOPIC` | A long random name (20-64 letters, digits, `-`, `_`) for the free ntfy phone app: install ntfy, tap +, subscribe to this name on ntfy.sh. Anyone who knows the name can read the alerts, so keep it private | phone alerts: the morning start card, trades, problems and the daily report (instead of, or as well as, Telegram) |
+| `HEALTHCHECK_URL` | The ping URL of a free healthchecks.io check, the dead-man: schedule `15-59 9 * * 1-5`, `* 10-14 * * 1-5` and `0-33 15 * * 1-5`, time zone Asia/Kolkata, grace 3 minutes, and its ntfy integration (your topic) so the same phone rings. titan2 pings it every minute from the moment it is ready, a few minutes after you start it, until it stops at about 15:40; when the pings stop (the laptop slept, lost power, or titan2 stopped) healthchecks rings. The schedule begins at 09:15 so that a start by 09:10 is in time (the server's check begins at 08:45: its bot starts by itself then). Pause the check on NSE holidays (it cannot know them), and when you stop titan2 before 15:33 pause it after titan2 has stopped, within a minute (not before: titan2 pings it while it stops; section 4); its next ping resumes it. It is a password too: keep it private | an alarm when titan2 stops (recommended: without it nothing outside the laptop notices) |
 
 **Your old v1 values** are in the file `agentic_trader/.env` inside
 `%USERPROFILE%\MCX\_titan_ec2_backup\titan_backup_2026-06-10.tgz`. Open the `.tgz` in File Explorer or
@@ -114,9 +115,25 @@ What you will see, in order:
 3. The self-check, one row per check: PASS, WARN or FAIL. A FAIL keeps new entries off; the session still runs and
    still manages exits. Fix the cause, stop (Ctrl+C once) and start again.
 4. `keep-awake on`, the dashboard address (section 7), and `PAPER session starting`.
-5. Log lines all day. A quiet day with no trades is normal: the entry rules are strict on purpose.
-6. From 15:15 it closes every position. At about 15:40 the bot stops: the window shows
-   `titan2: the trading day is done`, the daily report, and then `Press Enter to close this window`.
+5. On your phone, one **start card** (`START_CARD`) a minute or two later, once titan2 has prepared the day and
+   checked itself again: PAPER only, any FAIL or WARN self-check row, the clock, the network, AC or battery, each
+   strategy's mode and version, and the condor. **No card by 09:15 means titan2 is not running**: look at the window.
+   A restart that titan2 makes by itself comes as `BOT_RESTARTED` (a WARN after a crash, an INFO after a controlled
+   restart: a new Kite session, or the market feed gave up), and the card still comes once, from the first run that
+   gets that far; after the fifth crash restart it stops and says so (`BOT_GAVE_UP`: open positions are not managed;
+   start `run_today.ps1` again at once).
+6. Log lines all day. A quiet day with no trades is normal: the entry rules are strict on purpose, and the phone
+   stays quiet too, which is why the start card (and the dead-man, `HEALTHCHECK_URL`) matter. The phone also hears
+   of: each trade opened and closed (a placebo's begin "control trade (placebo), not a strategy result": it is the
+   G1 honesty check of section 8, not a strategy's trade, so ignore its profit or loss); a switch from the charger
+   to battery (`POWER`, then once more when it is back on AC); a day G1 marks as disturbed (`SESSION_IMPAIRED`, with
+   why). A warning about "Kite account check (no LIVE trading here)" is titan2 reading the Kite account it shares
+   with EC2: no real-money trade is involved.
+7. From 15:15 it closes every position. At 15:38 the phone gets the day's report: the trades, the halts, the
+   refusals by reason, the what-if totals saved so far (today's runs after the session), the condor, the bar check,
+   the alerts that were delayed or never delivered, and for each strategy "today counts for G1: yes" or "no" with
+   why. At about 15:40 the bot stops: the window shows `titan2: the trading day is done`, the daily report, and then
+   `Press Enter to close this window`.
 
 ## 4. How to stop safely
 
@@ -129,6 +146,12 @@ What you will see, in order:
   their exits before anything else. If the second press came while positions were being closed, the next start
   keeps closing them and keeps entries off until you run `titan2 resume` (section 7).
 - After an early stop with positions open during market hours, start `run_today.ps1` again soon.
+- **The dead-man check.** When you stop titan2 before 15:33, pause its check on healthchecks.io (the check's
+  Pause button) after titan2 has stopped: once the window says `titan2 stopped cleanly`, within a minute (open the
+  check's page before you press Ctrl+C). Not before: titan2 pings the check while it stops (every minute while it
+  closes positions, and once more as it exits), and a ping resumes a paused check. Unpaused, it rings your phone 3
+  to 4 minutes after that last ping. Its next ping, at your next start, resumes it. Leave it running otherwise: a
+  crash or a sleeping laptop is what it is there to catch.
 - **Stopping early and the G1 test.** G1 marks the day as disturbed (IMPAIRED) for every strategy, not only for the
   one holding a position, when you press Ctrl+C while any position is open (before the 15:15 close), and when titan2
   stays stopped for more than 10 minutes of entry time (09:20 to 14:55). To leave early without the mark, wait until
@@ -143,16 +166,36 @@ What you will see, in order:
 
 ## 5. Keep the laptop awake and online
 
-- **Plugged in.** titan2 logs the power source at the start and every 15 minutes, with a warning on battery.
+The self-check reads the four settings below that can end a session (as a standard user, no admin rights) and
+WARNs on each one that is wrong: `lid`, `restart_pending`, `update_hours` and `wifi`. They never block entries and
+send no message of their own: the start card on your phone lists them. One it cannot read is SKIP.
+
+- **Plugged in.** titan2 logs the power source at the start and every 15 minutes, with a warning on battery, and
+  looks at it every 30 seconds: a switch from the charger to battery sends `POWER` to your phone (and one more when
+  it is back on AC).
 - **Lid open**, or Control Panel, Power Options, "Choose what closing the lid does": When plugged in, Do nothing.
+  The `lid` row WARNs otherwise (on 2026-10-14 it was set to Sleep). That setting can be hidden from Control Panel;
+  then run `powercfg /setacvalueindex SCHEME_CURRENT SUB_BUTTONS LIDACTION 0` and
+  `powercfg /setactive SCHEME_CURRENT` (ask IT if it needs admin rights), or never close the lid in market hours.
 - **No sleep.** While it runs, titan2 asks Windows not to sleep on its idle timer. Closing the lid, the power
   button, a flat battery or a Windows Update restart still stop the laptop. As a backup, set Settings, System,
   Power, Screen and sleep, "When plugged in, put my device to sleep after": Never.
-- **Windows Update.** Settings, Windows Update, Advanced options, Active hours: for example 08:00 to 17:00, so it never
-  restarts the laptop during a session. Or pause updates for the week.
+- **Windows Update.** Settings, Windows Update, Advanced options, Active hours: 07:00 to 01:00, so it never restarts
+  the laptop between 08:00 and 16:00, when titan2 runs (the `update_hours` row WARNs on hours that leave any of it
+  open: on 2026-10-14 they began at 09:00, and Windows had restarted this laptop at 06:08, 06:55 and 07:34 on earlier
+  days). Or pause updates for the week. When the `restart_pending` row WARNs, Windows Update is waiting for a
+  restart: restart the laptop yourself after the session, never during one.
 - **A stable connection.** Use one network all day (Wi-Fi with a good signal, or a cable); do not switch hotspots
-  or VPNs in the middle of a session. If the data stops, new entries stop until it is fresh again; exits are never
-  blocked.
+  or VPNs in the middle of a session. The `wifi` row WARNs when more than one saved Wi-Fi network connects
+  automatically: Windows can then switch between them mid-session (on 2026-10-13 a switch dropped the Kite feed for
+  3 seconds). Untick "Connect automatically" on all but the one you trade on (Settings, Network & internet, Wi-Fi,
+  Manage known networks). If the data stops, new entries stop until it is fresh again; exits are never
+  blocked. A short drop costs less than before: a phone alert that cannot go out is kept and sent when the
+  internet is back (after one `ALERTS_DELAYED` line, "network back at ... after N s; K alerts delayed"; what is
+  still unsent when titan2 stops goes out at the next start); a failed name lookup (DNS, as on 2026-10-14 at 14:22)
+  reuses the last address that worked for that server, the certificate still checked; and from 09:00 to 15:30
+  titan2 keeps its Kite connection open with one small request a minute, so a quote after a quiet spell does not
+  wait about a second for a new connection.
 - **The clock: titan2 keeps its own.** At the start and every 5 minutes titan2 reads internet time (NTP, as the
   self-check does) and adds the difference to the Windows clock, so a Windows clock that drifts, or that you cannot
   fix because you have no admin rights, does not matter: the start of the window says, for example, "clock:
@@ -316,8 +359,11 @@ the dashboard stopped and that trading is unaffected.
   stands after the daily report, and stops entering if one of the research's kill rules fires (for example, real
   credits clearly below the backtest's). Expect a small gain most weeks and an occasional loss of up to about
   Rs 28,000 on paper: one bad week can wipe out months of gains. The window must be open at 15:25 on those days
-  (it already is in a normal session); a missed 15:25 skips that day's entry or check. `TITAN2_CONDOR=0` in the env
-  file turns it off.
+  (it already is in a normal session); a missed 15:25 skips that day's entry or check, and the next start writes a
+  MISSED note for it, which `& $t2 -m titan2 condor` shows (the start card and the 15:38 report show the latest one,
+  and a 3x stop). If a leg's quote is crossed at 15:25 (its bid above its ask), the check is tried again 45 s later,
+  and at the last try (also one too late for another, or one that ran late) the leg is valued at its worse side, so
+  such a quote cannot hide the 3x stop. `TITAN2_CONDOR=0` in the env file turns it off.
 
 ## 9. Why LIVE is refused on the laptop
 
@@ -340,10 +386,17 @@ after G1 and two separate human keys ([TITAN_INSTRUCTIONS.md](../TITAN_INSTRUCTI
    and the daily report was printed.
 2. The self-check at the start: every row PASS. Power may WARN if you were on battery; plug in next time.
    `network` WARNs when the line to Kite loses packets: expect some signals refused as QUOTE:FETCH_FAILED that day.
+   `notify` WARNs when no phone alert channel is set up, or `HEALTHCHECK_URL` is not (no dead-man); it sends no
+   test message, the start card does that job. `lid`, `restart_pending`, `update_hours` and `wifi` WARN on a laptop
+   setting that can end a session: fix each as section 5 says.
 3. Read the report in `%LOCALAPPDATA%\titan2\var\reports\`: the trades, the net after charges, the exit reasons, the
    refusals by gate, the paper orders that did not fill and why (their `SIM:` reasons), and the mismatches (there
-   should be none). After it comes the what-if table: what each refused entry would have made under titan2's own
-   exit rules after charges, plus running totals per refusal reason (saved in `reports\whatif-<date>.json`;
+   should be none). Its latency table also shows how long Kite's quote calls took (`quote_call_ms`, and
+   `quote_kite_ms` without titan2's own one-a-second pacing), how many were cold (no call in the minute before), and
+   each account read's round trip (`read_ms:LIVE:POSITIONS` is the real Kite one); after a week of these the numbers
+   say whether the laptop needs a cable. After it comes the what-if table: what each refused entry would have made
+   under titan2's own exit rules after charges, plus running totals per refusal reason (saved in
+   `reports\whatif-<date>.json`;
    `& $t2 -m titan2 whatif --date YYYY-MM-DD` reruns it while that day's login is valid). It flatters the refused
    trades (no depth, no slippage), so judge a filter only on weeks of totals.
 4. Search the log for trouble. Expect no lines, or only ones you can explain:
@@ -356,7 +409,8 @@ after G1 and two separate human keys ([TITAN_INSTRUCTIONS.md](../TITAN_INSTRUCTI
    had closed an idle connection and titan2 asked once more at once (it says how many times so far this run).
 
 5. The `power:` lines every 15 minutes: no battery warnings and no long gaps between their times (a gap means the
-   laptop slept).
+   laptop slept). The `quote call:` lines (one per Kite quote call, in the log file only) show each call's time and
+   whether it was cold.
 6. After the close, `& $t2 -m titan2 status` shows no open legs, no working orders and `halts: none` (or ones you
    understand).
 7. If anything looks wrong, keep the log and the report and write down what you saw. The RUNBOOK playbooks
@@ -390,6 +444,11 @@ soon as possible. It opens the same `run_today.ps1` window, so Ctrl+C works as u
 | setup: pip could not install requirements.lock | Check the internet connection and run setup again |
 | check: `env_file` FAIL | Fill in the three needed Kite values and save the file in Notepad |
 | check: `token` or `instruments` FAIL before today's first session | Expected: the session logs in first. To test now: `& $t2 -m titan2 token` |
+| check: `notify` WARN | Set `NTFY_TOPIC` (phone alerts) and `HEALTHCHECK_URL` (the dead-man) in the env file, section 2. No test message is sent: the start card on your phone each morning proves the alerts work |
+| check: `lid`, `restart_pending`, `update_hours` or `wifi` WARN | A laptop setting that can end a session: the lid set to sleep when plugged in, a Windows restart waiting, update hours that let Windows restart between 08:00 and 16:00, or more than one Wi-Fi network that connects by itself. Section 5 says how to fix each; they never block entries. SKIP means titan2 could not read that setting |
+| Phone: `POWER` "switched to battery power" | The charger came out or the power failed: plug it in. A second `POWER` says when it is back on AC |
+| Phone: `SESSION_IMPAIRED` | G1 marked the day (or days) as disturbed, with why: titan2 was stopped or started late, a pause, a Ctrl+C with a position open. Nothing to do now; a strategy with too many such days cannot pass G1 (section 8) |
+| Phone: "Kite account check (no LIVE trading here)" | titan2 could not read the Kite account (usually the internet). The laptop never trades LIVE: no real money is at risk; it asks again by itself |
 | check: `clock` FAIL | More than 1 s off (or possibly so: the reading's own error counts), so entries stay off: Sync now and the one-time fix in section 5, then stop (Ctrl+C once) and start again. The bot's own check after its morning preparation also lets entries start if the clock is right by then |
 | CRITICAL `UNKNOWN_POSITION`: "titan2 LIVE orders exist in this Kite account today" | EC2 traded LIVE today on the account you share. The laptop never touches those orders or positions: close or manage them in the Kite app (or on EC2). Its halt (`ACCOUNT:LIVE`) only blocks LIVE, which the laptop never trades. While such a position is still open, reconciliation also halts paper entries (`halt #N INVARIANT`): close it in Kite, then clear both with `& $t2 -m titan2 ack-halt N --note closed in Kite`. The alert repeats every 5 minutes until `& $t2 -m titan2 ack-alert recovery:LIVE:not_imported` |
 | check: `python`, `disk` or `db` FAIL | Fix the cause first (`python`: run setup again and start with `run_today.ps1`). Its halt stays after the fix: while a session runs, `& $t2 -m titan2 status` shows it as `halt #N INVARIANT`; clear it with `& $t2 -m titan2 ack-halt N --note fixed` |
